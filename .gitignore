@@ -1,0 +1,10 @@
+.tools/
+.npm-cache/
+bao-token-video/
+promo-video/
+video-state.html
+index.before-*.html
+qa-*.png
+*.docx
+node_modules/
+

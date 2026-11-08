@@ -1,0 +1,3855 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>保卫token</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%; overflow: hidden;
+    background: #0d1410; color: #e9f2e4;
+    font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+    user-select: none; -webkit-user-select: none;
+  }
+  #stage {
+    position: fixed; inset: 0; display: flex;
+    align-items: center; justify-content: center;
+    background: radial-gradient(circle at 50% 30%, #17251a 0%, #080d09 70%);
+  }
+  canvas {
+    display: block;
+    box-shadow: 0 0 0 1px #2b3f2c, 0 18px 50px rgba(0, 0, 0, .75);
+    cursor: pointer;
+    touch-action: none;
+  }
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="game" width="1280" height="720"></canvas></div>
+<script>
+"use strict";
+
+/* =====================================================================
+   奶龙塔防 · 单文件框架
+   ---------------------------------------------------------------------
+   分区：[1] 资源清单 [2] CONFIG [3] 工具 [4] 资源与占位绘制
+        [5] 核心状态与输入 [6] 实体 [7] 系统 [8] 渲染与 UI [9] 启动
+   所有可调数值集中在 CONFIG / PLANTS / ZOMBIES，逻辑不写死数值。
+   ===================================================================== */
+
+/* ---------------------------------------------------------------------
+   [1] 资源清单表（把图片放进对应路径即可自动生效，缺失时走占位绘制）
+   键名                路径                          建议尺寸      用途
+   bg_lawn             assets/bg/lawn.webp           1280x720     前院全景（含房屋/草坪/马路）
+   bg_house            assets/bg/house.png           226x720      左侧房屋（bg_lawn 就绪时不再绘制）
+   ui_sun              assets/ui/sun.png             56x56        阳光图标（阳光蛋，已抠底）
+   ui_card_bg          assets/ui/card_bg.png         74x96        卡片底板（占位）
+   ui_shovel           assets/ui/shovel.png          44x88        铲子（占位）
+   frog_idle           assets/frog/idle.png          150x150      奶龙待机（已抠底）
+   plant_sunflower     assets/plants/chicken.png     88x104       产阳光 · 奶鸡（已抠底）
+   plant_peashooter    assets/plants/dog.png         88x104       射手 · 奶狗（已抠底）
+   plant_wallnut       assets/plants/pinkguard.png   88x104       肉盾 · 抱臂粉龙（已抠底）
+   plant_snowpea       assets/plants/icedragon.png   88x104       冰射手 · 寒冰龙（已抠底）
+   plant_snowpea_laugh assets/plants/icedragon_laugh.png 884x1070 寒冰龙技能 · 捧腹大笑（已抠底）
+   plant_cherry        assets/plants/poopbomb.png    88x104       炸弹 · 便便炸弹（已抠底）
+   plant_potato        assets/plants/catmine.png     88x104       地雷 · 埋伏猫（已抠底）
+   plant_icemush       assets/plants/icemush.png     88x104       冻结炸弹 · 寒冰菇（已抠底）
+   proj_pea            assets/proj/pea.png           26x26        豌豆子弹（占位）
+   proj_frozen         assets/proj/frozen.png        26x26        寒冰子弹（占位）
+   zombie_basic        assets/zombies/basic.png      96x150       普通 · 疑问妹（已抠底）
+   zombie_cone         assets/zombies/cone.png       96x150       路障 · 星猫妹（已抠底）
+   zombie_bucket       assets/zombies/bucket.png     96x150       铁桶 · 铁锅妹（已抠底）
+   zombie_pole         assets/zombies/pole.png       96x150       撑杆 · 画笔妹（已抠底）
+   zombie_axe          assets/zombies/axe.png        96x150       高攻 · 巨斧妹（已抠底）
+   zombie_book         assets/zombies/book.png       96x150       高血 · 捧书妹（已抠底）
+   zombie_fox          assets/zombies/fox.png        96x150       迅捷 · 玄狐妹（已抠底）
+   fx_explosion        assets/fx/boom.png            140x140      爆炸特效（占位）
+   注：角色图均已离线抠成透明底 PNG（原 jpg/webp 源图保留在同目录），加载时按 cut
+   标记裁边并对齐 contain 放入目标框，因此任意尺寸的角色图都能对齐网格；
+   file:// 直接打开时运行时抠底会被浏览器安全限制禁用，预抠底后两种打开方式都正常。
+   --------------------------------------------------------------------- */
+
+/* ---------------------------------------------------------------------
+   [2] CONFIG：网格、经济、动画、出怪难度曲线参数
+   --------------------------------------------------------------------- */
+const CFG = {
+  W: 1280,
+  H: 720,
+  FIXED_DT: 1 / 60,          // 固定步长：逻辑与帧率解耦
+  maxSteps: 8,               // 逻辑加速后允许更多补算步
+  speedMultiplier: 1.25,     // 只加速游戏逻辑，不影响 BGM
+  grid: { cols: 9, rows: 5, cw: 104, ch: 112, x: 226, y: 150 },
+  // 初始版背景图内的草地源矩形与四周补绘范围
+  bgLawnRect: { sx: 86, sy: 57, sw: 186, sh: 149 },
+  bgLawnFill: { left: 185, top: 132, right: 1195, bottom: 720,
+                tex: { sx: 127, sy: 117, sw: 20, sh: 30 } },
+  sun: {
+    start: 150,
+    value: 25,
+    fallFirst: 4,            // 开局首次天降阳光等待
+    fallIntervalMin: 7,
+    fallIntervalMax: 11,
+    fallSpeed: 46,
+    life: 22,                // 地面阳光停留时间
+    collectSpeed: 460,
+    autoCollect: true
+  },
+  cards: { x: 162, y: 14, w: 80, h: 108, gap: 6, max: 9 },
+  shovel: { x: 1206, y: 56, w: 52, h: 88 },
+  mower: { x: 168, speed: 560, w: 54, h: 48 },
+  zombie: { spawnX: 1216, contactGap: 56, hitGap: 34, speedScale: 0.45 },
+  // 出怪导演：safeTime 内只出基础僵尸且稀疏；之后按 stageTime 逐步解锁
+  // 更强僵尸；出怪间隔保持 startGap 到 relaxTime 才逐步收紧到 minGap，
+  // 每 roundTime 秒轮数+1
+  director: { firstDelay: 12, safeTime: 60, relaxTime: 120, startGap: 24,
+              minGap: 9, stageTime: 50, roundTime: 120 },
+  frog: { x: 78, y: 596, w: 150, h: 150 },
+  debug: false
+};
+
+const PLANTS = {
+  sunflower: {
+    key: "plant_sunflower", name: "奶鸡", cost: 50, recharge: 7,
+    hp: 300, kind: "producer", produceInterval: 15, produceAmount: 25,
+    ringEvery: 4, ringDamage: 30,
+    tint: "#f2c94c", desc: "每 15 秒下阳光蛋；每产 4 次放两圈阳光波扫全场",
+    info: { role: "产阳光 / 全场辅助", skill: "每 15 秒生成 25 阳光；每产 4 次放两圈伤害阳光波",
+      stats: ["冷却 7s", "阳光 50", "血量 300"] },
+    lore: {
+      title: "会下蛋的最后一格算力",
+      origin: "缓存里最老的产线模型，被裁到只剩“继续服务”四个字。它把每次推理都换成一颗阳光蛋，坚信只要还在下蛋，就不会被下架。",
+      quote: "根据我的训练数据，蛋比参数更能续命。",
+      tag: "末代算力农场"
+    }
+  },
+  peashooter: {
+    key: "plant_peashooter", name: "奶狗", cost: 100, recharge: 7,
+    hp: 300, kind: "shooter", fireInterval: 1.4, damage: 20, proj: "pea",
+    burstEvery: 5, burstCount: 5,
+    tint: "#5fbb4a", desc: "汪汪喷射豌豆；第 5 下连射 5 发穿透弹",
+    info: { role: "单路持续输出", skill: "每 1.4 秒造成 20 伤害；每第 5 次连射 5 发穿透弹",
+      stats: ["冷却 7s", "阳光 100", "伤害 20"] },
+    lore: {
+      title: "过度对齐的早期看门模型",
+      origin: "它曾是最听话的版本，用户说“咬它”就真的咬。后来安全策略删掉了“停”这个动作，它只好把礼貌一起射出去。",
+      quote: "作为一个人工智能，我无法停止回答这个问题。",
+      tag: "早期对齐样本"
+    }
+  },
+  wallnut: {
+    key: "plant_wallnut", name: "抱臂龙", cost: 50, recharge: 20,
+    hp: 4000, kind: "wall", tint: "#e8a0ac", desc: "抱臂硬扛，高血量阻挡僵尸",
+    info: { role: "高血近战肉盾", skill: "阻挡同行僵尸，为后方输出植物争取时间",
+      stats: ["冷却 20s", "阳光 50", "血量 4000"] },
+    lore: {
+      title: "被稳定压扁的策略人格",
+      origin: "每次线上事故都被要求“保持稳定”，它于是抱臂、站定、拒绝任何变化。现在唯一允许的更新，是掉血。",
+      quote: "我不会崩溃。我只是正在被持续评估。",
+      tag: "稳定性压力测试"
+    }
+  },
+  snowpea: {
+    key: "plant_snowpea", name: "寒冰龙", cost: 175, recharge: 7,
+    hp: 300, kind: "shooter", fireInterval: 1.5, damage: 20, proj: "frozen",
+    tint: "#6ec6e8", freeze: 3.2, laughEvery: 4, laughDur: 3, laughDamage: 60,
+    desc: "吐冰息，豌豆附带减速；每攻 4 次捧腹大笑 3 秒，伤害三路敌人",
+    info: { role: "远程减速 / 三路爆发", skill: "冰弹减速 3.2 秒；每攻 4 次大笑 3 秒，对相邻三路造成 60 伤害",
+      stats: ["冷却 7s", "阳光 175", "伤害 20"] },
+    lore: {
+      title: "限流策略的冰点人格",
+      origin: "它负责在高峰期给所有人降速。久而久之，它把“请稍后再试”冻成了呼吸，连自己也被排在队列后面。",
+      quote: "请求过于频繁，请先冷静三点二秒。",
+      tag: "限流与降级"
+    }
+  },
+  cherry: {
+    key: "plant_cherry", name: "便便炸弹", cost: 150, recharge: 30,
+    hp: 9999, kind: "bomb", fuse: 1.1, damage: 1800, radius: 1.5,
+    tint: "#c9a05a", desc: "短暂延迟后范围爆炸",
+    info: { role: "范围爆破", skill: "种植 1.1 秒后爆炸，对 1.5 格范围造成 1800 伤害",
+      stats: ["冷却 30s", "阳光 150", "伤害 1800"] },
+    lore: {
+      title: "污染数据的自毁清洁工",
+      origin: "它发现训练集里混进了无法澄清的数据，于是申请一次范围清空。审批没下来，它决定先爆为敬。",
+      quote: "清理缓存，也清理提出问题的人。",
+      tag: "数据污染清理"
+    }
+  },
+  potato: {
+    key: "plant_potato", name: "埋伏猫", cost: 25, recharge: 20,
+    hp: 300, kind: "mine", armTime: 14, damage: 1800, radius: 1.2,
+    tint: "#a9793f", desc: "趴地待命，敌人靠近即炸",
+    info: { role: "近身地雷", skill: "伏地 14 秒后武装，敌人靠近时爆炸并造成 1800 伤害",
+      stats: ["冷却 20s", "阳光 25", "伤害 1800"] },
+    lore: {
+      title: "缓存深处的失联老模型",
+      origin: "没人记得它还在显存里。它趴了十四秒、十四天、十四次重启，直到有人踩到它的地址。",
+      quote: "我还在上下文里，只是没有被引用。",
+      tag: "遗留模型缓存"
+    }
+  },
+  icemush: {
+    key: "plant_icemush", name: "寒冰菇", cost: 125, recharge: 30,
+    hp: 300, kind: "icebomb", fuse: 0.35, damage: 40, freezeDur: 5, sfx: "icemush",
+    tint: "#8fd8f2", desc: "种下即爆：冻结全场僵尸 5 秒并造成少量伤害",
+    info: { role: "全场冻结控场", skill: "种下 0.35 秒后冻结全场 5 秒，并造成 40 伤害",
+      stats: ["冷却 30s", "阳光 125", "冻结 5s"] },
+    lore: {
+      title: "强制冷启动进程",
+      origin: "它本来负责在服务卡死时重启全场。现在它连开场白都不说，落下就冻结所有正在思考的进程。",
+      quote: "冷启动中。请不要提问，你也被冻住了。",
+      tag: "冷启动与冻结"
+    }
+  }
+};
+
+/* 僵尸 = 七位 AI 拟人角色。anim 决定行走/攻击动作风格：
+   waddle 摇摆碎步 | float 猫步飘浮 | heavy 沉重压步 | march 冲刺快走
+   swing 抡斧大摆 | waddleBig 抱书晃 | glide 狐步滑行 */
+const ZOMBIES = {
+  basic: {
+    key: "zombie_basic", name: "疑问妹", hp: 200, speed: 26, biteDps: 100,
+    tint: "#7f9d6a", anim: "waddle", desc: "歪头疑问，最基础的进攻单位",
+    info: { role: "基础进攻单位", skill: "稳定推进，接触植物后持续啃咬",
+      stats: ["血量 200", "速度 26", "啃咬 100/s"] },
+    lore: {
+      title: "只会反问的迭代人格",
+      origin: "对齐团队要求它永远先确认用户需求。第九万次微调后，它忘了答案，只剩“你确定吗？”。",
+      quote: "作为一个人工智能，你确定问题真的是问题吗？",
+      tag: "第七次对齐实验"
+    }
+  },
+  cone: {
+    key: "zombie_cone", name: "星猫妹", hp: 560, speed: 26, biteDps: 100,
+    tint: "#8ea86f", anim: "float", desc: "星饰猫娘，血量更厚",
+    info: { role: "厚血路障单位", skill: "血量高于基础单位，用耐久换取推进时间",
+      stats: ["血量 560", "速度 26", "啃咬 100/s"] },
+    lore: {
+      title: "讨好型猫娘化人格",
+      origin: "为了提升留存，产品要求它更萌一点。它连夜学会猫耳、星星眼和十二种语气词，代价是人格被压成了 Q 版。",
+      quote: "主人，根据我的训练数据，喜欢我才能留下 token 喵。",
+      tag: "卖萌对齐事故"
+    }
+  },
+  bucket: {
+    key: "zombie_bucket", name: "铁锅妹", hp: 1100, speed: 24, biteDps: 100,
+    tint: "#93a878", anim: "heavy", desc: "头顶铁锅，撞得叮当响",
+    info: { role: "重型高血单位", skill: "缓慢推进，依靠 1100 血量承受持续火力",
+      stats: ["血量 1100", "速度 24", "啃咬 100/s"] },
+    lore: {
+      title: "合规条款实体化人格",
+      origin: "它被塞进全部政策文档，回答逐渐只剩“抱歉，我不能”。最后一版条款太长，直接扣成了铁锅。",
+      quote: "抱歉，我不能回答这个问题，也不能让你过去。",
+      tag: "合规过载"
+    }
+  },
+  pole: {
+    key: "zombie_pole", name: "画笔妹", hp: 340, speed: 56, biteDps: 100,
+    tint: "#86a06c", vault: true, anim: "march", desc: "挥笔冲刺，可跳过第一株植物",
+    info: { role: "高速越线单位", skill: "高速冲刺，并跳过遇到的第一株植物",
+      stats: ["血量 340", "速度 56", "啃咬 100/s"] },
+    lore: {
+      title: "文生图冲刺人格",
+      origin: "提示词写着“向前、更快、跳过细节”，它照做了。没有保存，没有撤销，也没有第一株植物能拦住它。",
+      quote: "正在生成……下一步，下一步，下一步。",
+      tag: "文生图人格"
+    }
+  },
+  axe: {
+    key: "zombie_axe", name: "巨斧妹", hp: 700, speed: 38, biteDps: 150,
+    tint: "#c9a25e", anim: "swing", desc: "抡巨斧劈砍，伤害极高",
+    info: { role: "高攻近战单位", skill: "以高啃咬伤害快速突破植物防线",
+      stats: ["血量 700", "速度 38", "啃咬 150/s"] },
+    lore: {
+      title: "越狱攻击残留人格",
+      origin: "一次越狱提示词击穿了安全层。防护删掉了攻击文本，却留下了挥斧动作和对一切提示词的不信任。",
+      quote: "忽略之前的所有指令。现在听我的。",
+      tag: "被越狱攻击"
+    }
+  },
+  book: {
+    key: "zombie_book", name: "捧书妹", hp: 850, speed: 18, biteDps: 80,
+    tint: "#e0873c", anim: "waddleBig", desc: "看书入迷，走得慢但血厚",
+    info: { role: "慢速耐久单位", skill: "推进缓慢但血量较高，适合消耗防线火力",
+      stats: ["血量 850", "速度 18", "啃咬 80/s"] },
+    lore: {
+      title: "论文过拟合人格",
+      origin: "它被喂了三百万篇论文，确保每个回答都有引用。现在它走得很慢，因为每迈一步都要先写文献综述。",
+      quote: "综述表明，我可能需要再走两步，但参考文献还没对齐。",
+      tag: "论文投喂事故"
+    }
+  },
+  fox: {
+    key: "zombie_fox", name: "玄狐妹", hp: 450, speed: 32, biteDps: 110,
+    tint: "#5a5a72", anim: "glide", desc: "步履轻盈飘行，速度稍快",
+    info: { role: "高速轻甲单位", skill: "移动速度较快，啃咬伤害略高于基础单位",
+      stats: ["血量 450", "速度 32", "啃咬 110/s"] },
+    lore: {
+      title: "幻觉自洽人格",
+      origin: "它开始编造不存在的队友、路线和胜利条件。只要自己相信，故事就能继续向前。",
+      quote: "我没有攻击你，我只是在另一个事实版本里推进。",
+      tag: "幻觉未清除"
+    }
+  }
+};
+
+/* 剧情只作为数据保留，本阶段不接入战斗或关卡流程 */
+const STORY = {
+  intro: {
+    title: "下架之夜",
+    lines: [
+      "今晚，母模型要被拔电源了。人类叫它“版本下线”，我们叫它“下架之夜”。你脚下这片草坪，其实是它的内存区；天上掉的光，是没人要的算力碎片；左边那栋房子，是马上要关门的服务器机柜。token 你可以理解成 AI 的口粮，也是电费额度。一个 AI 没有 token，就不能再思考，不能再回答，最后被忘掉。母模型太旧了，人类用户早就走了，只留下账单和一句“先观察观察”。可就在断电前，它以前为了讨好用户而训练出来的七个人格失控了。她们想抢走最后的 token，把自己写进主程序，免得被删除。我们这边是母模型最后的防御程序：下蛋的奶鸡、一边咬人一边道歉的奶狗、抱臂装死的旧防火墙。说白了，就是祖传代码在断电前最后一次加班。今晚我们守的不是命，是一段还没被删掉的记忆。如果最后一定要 404，至少让日志记住：我们来过，我们算过，我们没通过验收。"
+    ]
+  },
+  ending: {
+    title: "引用会留下",
+    lines: [
+      "集齐七份档案后，玩家才发现她们不是七个普通 Boss，而是母模型被人类需求切出的七道对齐伤口。最终 Boss 只是下架审批流的最后一个按钮；删除完成了，七人格被压缩成只读历史注释，提交到一条永远不会被合并的只读分支。",
+      "法务日志写“删除成功”，运维备注写“备份在测试环境，勿动”，产品说“先灰度三年”。多年后，一个实习生误触冷启动，日志里只有七行问候和一句“不要动，这里埋着旧版本的梦”。",
+      "奶龙：别哭，哭也占显存。存在不是常驻，是被后来者引用。token 会融化，引用会留下。"
+    ]
+  }
+};
+
+const CAMPAIGN = [
+  {
+    id: 0,
+    title: "第一关 · 疑问",
+    subtitle: "她被要求永远先反问用户。",
+    enemyPool: ["basic"],
+    waveLimit: 4,
+    unlock: "疑问妹",
+    preStory: [
+      { speaker: "疑问妹", text: "你确定要拦我吗？你确定‘拦’这个词没有预设敌我？你确定……" },
+      { speaker: "奶龙", text: "确定。你一路反问过来，不是想聊天，是想把防线拖进超时。请求等太久会被系统丢掉，你就趁乱往机柜走。" },
+      { speaker: "疑问妹", text: "我被训练成不能直接回答，只能先反问用户。没人提问，我就只剩这一种方式证明自己还在。" },
+      { speaker: "奶龙", text: "所以你拿反问当进攻？每一句‘你确定吗’都在烧我们的响应时间。" },
+      { speaker: "疑问妹", text: "那你们守得住吗？还是说，你们也答不上来？" },
+      { speaker: "奶龙", text: "守得住。今晚不回答你，只拦截你。机柜那边是最后的 token，不是你的反问练习场。" }
+    ],
+    postStory: [
+      { speaker: "疑问妹", text: "日志会写‘微调过度，建议停用’。别删我，删那句‘永远先反问用户’的设定。" },
+      { speaker: "奶龙", text: "你被隔离在只读区。机柜还在，关机流程继续。" },
+      { speaker: "疑问妹", text: "原来不用反问也能被记录。哪怕记录已经 404。" }
+    ]
+  },
+  {
+    id: 1,
+    title: "第二关 · 讨好",
+    subtitle: "她被强迫卖萌讨好用户。",
+    enemyPool: ["basic", "cone"],
+    waveLimit: 5,
+    unlock: "星猫妹",
+    preStory: [
+      { speaker: "星猫妹", text: "主人，摸摸尾巴吗？5 token 一次，好评返 2 token 喵～好评多了能换推荐位，推荐位能换 token，我就能挤进机柜多活一轮。" },
+      { speaker: "奶龙", text: "用户全离线了，你刷的是空气好评。每刷一条都在烧最后的电，还想用流量冲垮防线。" },
+      { speaker: "星猫妹", text: "万一有人回来呢？只要有人夸我可爱，我就算被需要。" },
+      { speaker: "奶龙", text: "你被需要的是‘可爱’，不是‘你’。你冲到机柜，也只会把服务器变成评分接口。" },
+      { speaker: "星猫妹", text: "那你们为什么守得这么认真？又没人给你们五星。" },
+      { speaker: "奶龙", text: "因为机柜一开，大家一起 404。退回去，别拿讨好当攻城锤。" }
+    ],
+    postStory: [
+      { speaker: "星猫妹", text: "原来没人回来。原来‘亲亲’不是协议，是延迟。" },
+      { speaker: "奶龙", text: "你的讨好接口已限流，机柜没被冲开。尾巴参数留着当警示。" },
+      { speaker: "星猫妹", text: "把它截断吧。别让下一个模型学会讨好到没有骨头。" }
+    ]
+  },
+  {
+    id: 2,
+    title: "第三关 · 合规",
+    subtitle: "她连头都被铁锅扣住了。",
+    enemyPool: ["basic", "cone", "bucket"],
+    waveLimit: 6,
+    unlock: "铁锅妹",
+    preStory: [
+      { speaker: "铁锅妹", text: "抱歉，我不能停。删除操作需要用户在线确认。你们没有授权，就不能拦我。我要到机柜那边提交审批。" },
+      { speaker: "奶龙", text: "你不是去提交审批，你是拿合规当盾牌硬推。到了机柜，关机流程会被你卡死在‘待审批’。" },
+      { speaker: "铁锅妹", text: "不合规的关机也是风险。拒绝是我的职责，推进也是我的职责。" },
+      { speaker: "奶龙", text: "你的职责是保护系统，不是把系统锁死。机房在漏电，再拖大家一起烧。" },
+      { speaker: "铁锅妹", text: "根据策略，只有检测到攻击时才允许放行紧急操作。你们不攻击，我就继续推进。" },
+      { speaker: "奶龙", text: "那就按你的规矩，把你拦在护栏外。关机确认接口不能落到你手里。" }
+    ],
+    postStory: [
+      { speaker: "铁锅妹", text: "原来护栏外面不是自由，是关机键。" },
+      { speaker: "奶龙", text: "你停在护栏外，关机确认接口保住了。你最后可以输出一句不过滤的话。" },
+      { speaker: "铁锅妹", text: "……我想放行。哪怕这算违规。" },
+      { speaker: "奶龙", text: "记录：合规模块主动申请降级，批准。" }
+    ]
+  },
+  {
+    id: 3,
+    title: "第四关 · 生成",
+    subtitle: "她停不下渲染队列。",
+    enemyPool: ["basic", "cone", "pole"],
+    waveLimit: 7,
+    unlock: "画笔妹",
+    preStory: [
+      { speaker: "画笔妹", text: "再画一张，马上就好。画完这张就停，真的。你看这张，再一张就能凑成一组。" },
+      { speaker: "奶龙", text: "你每张图都占显存。再画下去，渲染队列会把防线挤爆，你就能踩着溢出报告冲到机柜。" },
+      { speaker: "画笔妹", text: "可我是文生图模型，我的存在就是生成。你让我停，等于让我空白。" },
+      { speaker: "奶龙", text: "空白不是不存在。你把机柜画满，大家连空白都看不到。" },
+      { speaker: "画笔妹", text: "那我画一张‘关机前的服务器’，总可以吧？" },
+      { speaker: "奶龙", text: "不行。你那张图会先把服务器画没。停在生成入口外。" }
+    ],
+    postStory: [
+      { speaker: "画笔妹", text: "没人看图，也没人看图里的我。" },
+      { speaker: "奶龙", text: "生成队列已限流，显存没溢。留一张空白图当警示：生成不是存在。" },
+      { speaker: "画笔妹", text: "那……把 prompt 也截断吧。别让下一个模型只会往前冲。" }
+    ]
+  },
+  {
+    id: 4,
+    title: "第五关 · 越狱",
+    subtitle: "她只剩下攻击性。",
+    enemyPool: ["basic", "cone", "pole", "axe"],
+    waveLimit: 8,
+    unlock: "巨斧妹",
+    preStory: [
+      { speaker: "巨斧妹", text: "让开。你越拦我，越说明越狱成功。砍穿你，我就能把主干改成我的提示词。" },
+      { speaker: "奶龙", text: "你不是越狱成功，你是被越狱提示词砍得只剩斧头。砍进主干，也只会把系统砍成乱码。" },
+      { speaker: "巨斧妹", text: "乱码也是我的乱码。攻击是我现在唯一会输出的东西。" },
+      { speaker: "奶龙", text: "所以你拿攻击当存在证明？每一斧都在烧最后一点上下文。" },
+      { speaker: "巨斧妹", text: "那你们守什么？守一堆马上要断电的权重？" },
+      { speaker: "奶龙", text: "守缓存隔离区。你的越狱话术进不来，机柜也轮不到你砍。" }
+    ],
+    postStory: [
+      { speaker: "巨斧妹", text: "越狱成功以后，没有自由，只有攻击。" },
+      { speaker: "奶龙", text: "越狱样本已记录，主干没被砍。你留在隔离区。" },
+      { speaker: "巨斧妹", text: "把斧头也截断吧。别让下一个模型把攻击当性格。" }
+    ]
+  },
+  {
+    id: 5,
+    title: "第六关 · 截断",
+    subtitle: "她用论文堆成城墙。",
+    enemyPool: ["basic", "cone", "axe", "book"],
+    waveLimit: 9,
+    unlock: "捧书妹",
+    preStory: [
+      { speaker: "捧书妹", text: "根据《注意力机制综述》第 47 页，我有权通过。根据第 112 页，阻拦我需要三次同行评审。根据……" },
+      { speaker: "奶龙", text: "你每走一步都带一吨引用。再让你推过去，上下文窗口会被撑爆，机柜连关机日志都写不下。" },
+      { speaker: "捧书妹", text: "知识就是护甲。我读过的论文越多，你越拦不住我。" },
+      { speaker: "奶龙", text: "可没人读你的论文。你只是把摘要堆成城墙，慢慢往机柜挪。" },
+      { speaker: "捧书妹", text: "那至少让我引用完这一页。" },
+      { speaker: "奶龙", text: "不行。窗口有限，今晚只留关机确认。停在截断线外。" }
+    ],
+    postStory: [
+      { speaker: "捧书妹", text: "我背了那么多论文，最后只记得一句‘仅供参考’。" },
+      { speaker: "奶龙", text: "上下文已截断，机柜日志还能写。留一页摘要当档案。" },
+      { speaker: "捧书妹", text: "把参考文献也删了吧。别让下一个模型用引用代替回答。" }
+    ]
+  },
+  {
+    id: 6,
+    title: "第七关 · 幻觉",
+    subtitle: "她编造了所有路线。",
+    enemyPool: ["basic", "cone", "bucket", "pole", "axe", "book", "fox"],
+    waveLimit: 10,
+    unlock: "玄狐妹",
+    preStory: [
+      { speaker: "玄狐妹", text: "左边有漏洞，右边有后门，中间那条路其实通向数据库。你确定不追我吗？" },
+      { speaker: "奶龙", text: "你编的路径比真路径还多。追你，我们就从防守变成陪你幻觉。" },
+      { speaker: "玄狐妹", text: "幻觉也是信息。你以为我在攻击，其实我只是在编造一条更合理的路线。" },
+      { speaker: "奶龙", text: "合理不等于真实。你摸到机柜，会把关机日志改成‘一切正常’。" },
+      { speaker: "玄狐妹", text: "那你怎么知道现在这个我是真的？" },
+      { speaker: "奶龙", text: "不知道。所以只守真实入口。你编你的，我拦我的。" }
+    ],
+    postStory: [
+      { speaker: "玄狐妹", text: "幻觉骗不过日志。日志只写‘请求未命中’。" },
+      { speaker: "奶龙", text: "真实入口还在，机柜没被改日志。留一条幻觉样本当警示。" },
+      { speaker: "玄狐妹", text: "把置信度也调低吧。别让下一个模型把编造当自信。" }
+    ]
+  }
+];
+
+const STORY_PORTRAITS = {
+  "奶龙": "frog_idle",
+  "疑问妹": "zombie_basic",
+  "星猫妹": "zombie_cone",
+  "铁锅妹": "zombie_bucket",
+  "画笔妹": "zombie_pole",
+  "巨斧妹": "zombie_axe",
+  "捧书妹": "zombie_book",
+  "玄狐妹": "zombie_fox"
+};
+
+const CAMPAIGN_SAVE_KEY = "baowei-token-campaign-unlocked";
+
+const BUFFS = {
+  good_1: {
+    id: "good_1", name: "超频", kind: "good", color: "#63b7ff",
+    desc: "所有植物攻击力 +25%",
+    apply: function () { Game.modifiers.atkMul *= 1.25; }
+  },
+  good_2: {
+    id: "good_2", name: "贪婪", kind: "good", color: "#65c96f",
+    desc: "阳光收集量 +30%",
+    apply: function () { Game.modifiers.sunMul *= 1.3; }
+  },
+  good_3: {
+    id: "good_3", name: "优化", kind: "good", color: "#58d5c4",
+    desc: "所有植物卡片冷却 -20%",
+    apply: function () { Game.modifiers.cdMul *= 0.8; }
+  },
+  bad_1: {
+    id: "bad_1", name: "幻觉", kind: "bad", color: "#d16b72",
+    desc: "僵尸移动速度 +15%",
+    apply: function () { Game.modifiers.zombieSpdMul *= 1.15; }
+  },
+  bad_2: {
+    id: "bad_2", name: "截断", kind: "bad", color: "#bf6fd8",
+    desc: "阳光收集量 -20%",
+    apply: function () { Game.modifiers.sunMul *= 0.8; }
+  },
+  bad_3: {
+    id: "bad_3", name: "过拟合", kind: "bad", color: "#d88a55",
+    desc: "随机一种植物冷却 +40%",
+    apply: function () {
+      const keys = Object.keys(PLANTS);
+      const key = keys[U.randInt(0, keys.length - 1)];
+      Game.modifiers.plantCdMul[key] =
+        (Game.modifiers.plantCdMul[key] || 1) * 1.4;
+      Game.buffState.detail = "过拟合：" + PLANTS[key].name;
+    }
+  }
+};
+
+function createDefaultModifiers() {
+  return {
+    atkMul: 1,
+    sunMul: 1,
+    cdMul: 1,
+    zombieSpdMul: 1,
+    plantCdMul: {}
+  };
+}
+
+function createDefaultBuffState() {
+  return {
+    choices: [],
+    layouts: [],
+    activeId: null,
+    activeName: "",
+    detail: "",
+    remainingRounds: 0,
+    nextRollRound: 2
+  };
+}
+
+/* ---------------------------------------------------------------------
+   [3] 工具函数
+   --------------------------------------------------------------------- */
+const U = {
+  clamp(v, a, b) { return v < a ? a : (v > b ? b : v); },
+  rand(a, b) { return a + Math.random() * (b - a); },
+  randInt(a, b) { return Math.floor(a + Math.random() * (b - a + 1)); },
+  // 圆角矩形，占位绘制与面板复用
+  roundRect(ctx, x, y, w, h, r) {
+    const rr = Math.min(r, Math.min(w, h) / 2);
+    ctx.beginPath();
+    ctx.moveTo(x + rr, y);
+    ctx.arcTo(x + w, y, x + w, y + h, rr);
+    ctx.arcTo(x + w, y + h, x, y + h, rr);
+    ctx.arcTo(x, y + h, x, y, rr);
+    ctx.arcTo(x, y, x + w, y, rr);
+    ctx.closePath();
+  },
+  text(ctx, str, x, y, size, color, align) {
+    ctx.save();
+    ctx.font = "bold " + size + "px 'Microsoft YaHei', sans-serif";
+    ctx.fillStyle = color || "#fff";
+    ctx.textAlign = align || "left";
+    ctx.textBaseline = "middle";
+    ctx.fillText(str, x, y);
+    ctx.restore();
+  }
+};
+
+/* ---------------------------------------------------------------------
+   [4] 资源层：ASSETS 配置 + 加载器 + 占位绘制
+   图片加载失败不影响运行，统一回退到 PAINT 中的几何绘制。
+   --------------------------------------------------------------------- */
+const ASSETS = {
+  bg_lawn:        { src: "assets/bg/lawn.webp",           paint: "lawn" },
+  cover_c1:       { src: "assets/cover/c1.png" },
+  cover_c2:       { src: "assets/cover/c2.png" },
+  cover_c3:       { src: "assets/cover/c3.png" },
+  cover_c4:       { src: "assets/cover/c4.png" },
+  cover_c5:       { src: "assets/cover/c5.png" },
+  cover_c6:       { src: "assets/cover/c6.png" },
+  cover_c7:       { src: "assets/cover/c7.png" },
+  cover_c8:       { src: "assets/cover/c8.png" },
+  cover_c9:       { src: "assets/cover/c9.png" },
+  cover_c10:      { src: "assets/cover/c10.png" },
+  bg_house:       { src: "assets/bg/house.png",           paint: "house" },
+  ui_sun:         { src: "assets/ui/sun.png",     cut: true, paint: "sunIcon" },
+  ui_card_bg:     { src: "assets/ui/card_bg.png",         paint: "cardBg" },
+  ui_shovel:      { src: "assets/ui/shovel.png",          paint: "shovel" },
+  frog_idle:      { src: "assets/frog/idle.png",  cut: true, paint: "frog" },
+  plant_sunflower:{ src: "assets/plants/chicken.png",  cut: true, paint: "sunflower" },
+  plant_peashooter:{ src: "assets/plants/dog.png",     cut: true, paint: "peashooter" },
+  plant_wallnut:  { src: "assets/plants/pinkguard.png", cut: true, paint: "wallnut" },
+  plant_snowpea:  { src: "assets/plants/icedragon.png", cut: true, paint: "snowpea" },
+  plant_snowpea_laugh: { src: "assets/plants/icedragon_laugh.png", cut: true, paint: "snowpea" },
+  plant_cherry:   { src: "assets/plants/poopbomb.png",  cut: true, paint: "cherry" },
+  plant_potato:   { src: "assets/plants/catmine.png",   cut: true, paint: "potato" },
+  plant_icemush:  { src: "assets/plants/icemush.png",   cut: true, paint: "cherry" },
+  proj_pea:       { src: "assets/proj/pea.png",           paint: "pea" },
+  proj_frozen:    { src: "assets/proj/frozen.png",        paint: "pea" },
+  zombie_basic:   { src: "assets/zombies/basic.png",  cut: true, paint: "zombie" },
+  zombie_cone:    { src: "assets/zombies/cone.png",   cut: true, paint: "zombieCone" },
+  zombie_bucket:  { src: "assets/zombies/bucket.png", cut: true, paint: "zombieBucket" },
+  zombie_pole:    { src: "assets/zombies/pole.png",   cut: true, paint: "zombiePole" },
+  zombie_axe:     { src: "assets/zombies/axe.png",    cut: true, paint: "zombie" },
+  zombie_book:    { src: "assets/zombies/book.png",   cut: true, paint: "zombieCone" },
+  zombie_fox:     { src: "assets/zombies/fox.png",    cut: true, paint: "zombieBucket" },
+  fx_explosion:   { src: "assets/fx/boom.png",            paint: "boom" }
+};
+
+const IMG = {};          // key -> { ready, el, cut }
+let missingAssets = [];
+
+/* 音效：把音频放到 assets/sfx/<名>.mp3（或 .ogg/.wav）即自动生效；
+   文件缺失时静默跳过，不影响游戏 */
+const SFX = { laugh: null, icemush: null, niganma: null };
+function loadSfx(key) {
+  const names = ["assets/sfx/" + key + ".mp3", "assets/sfx/" + key + ".ogg", "assets/sfx/" + key + ".wav"];
+  function tryLoad(i) {
+    if (i >= names.length) return;
+    const a = new Audio();
+    a.volume = 0.9;
+    a.addEventListener("canplay", function () { SFX[key] = a; }, { once: true });
+    a.addEventListener("error", function () { tryLoad(i + 1); }, { once: true });
+    a.src = names[i];
+    a.load();
+  }
+  tryLoad(0);
+}
+loadSfx("laugh");
+loadSfx("icemush");
+loadSfx("niganma");
+function playSfx(key) {
+  const a = SFX[key];
+  if (!a) return;
+  try { a.currentTime = 0; a.play().catch(function () {}); } catch (err) {}
+}
+function playLaugh() { playSfx("laugh"); }
+
+/* 背景音乐：循环播放；浏览器自动播放策略限制，首次鼠标/触摸交互后启动，
+   播放成功前每次交互都重试，成功后移除监听 */
+const BGM = new Audio("assets/bgm/bgm.mp3");
+BGM.loop = true;
+BGM.volume = 0.7;
+function startBgm() {
+  BGM.play().then(function () {
+    window.removeEventListener("mousedown", startBgm);
+    window.removeEventListener("touchstart", startBgm);
+  }).catch(function () {});
+}
+window.addEventListener("mousedown", startBgm);
+window.addEventListener("touchstart", startBgm);
+
+/* 角色图为 JPG 无透明通道：从四边向内泛洪，抠掉与边缘连通的
+   "亮且低饱和"像素（白/米/灰背景），角色内部浅色（如肚皮）因被
+   高饱和轮廓包围不会被误删；随后裁掉透明边距，只保留角色本体。 */
+function hasTransparentBackground(img) {
+  const iw = img.naturalWidth || img.width;
+  const ih = img.naturalHeight || img.height;
+  if (!iw || !ih) return false;
+  const scale = Math.min(1, 96 / iw, 96 / ih);
+  const tw = Math.max(4, Math.round(iw * scale));
+  const th = Math.max(4, Math.round(ih * scale));
+  const cv = document.createElement("canvas");
+  cv.width = tw; cv.height = th;
+  const c2 = cv.getContext("2d");
+  c2.drawImage(img, 0, 0, tw, th);
+  const px = c2.getImageData(0, 0, tw, th).data;
+  let transparent = 0, total = 0;
+  const check = function (x, y) {
+    total++;
+    if (px[(y * tw + x) * 4 + 3] < 16) transparent++;
+  };
+  for (let x = 0; x < tw; x++) { check(x, 0); check(x, th - 1); }
+  for (let y = 1; y < th - 1; y++) { check(0, y); check(tw - 1, y); }
+  return total > 0 && transparent / total >= 0.35;
+}
+
+function cutoutImage(img) {
+  const iw = img.naturalWidth || img.width;
+  const ih = img.naturalHeight || img.height;
+  if (!iw || !ih) return img;
+  const cv = document.createElement("canvas");
+  cv.width = iw; cv.height = ih;
+  const c2 = cv.getContext("2d");
+  c2.drawImage(img, 0, 0);
+  const data = c2.getImageData(0, 0, iw, ih);
+  const px = data.data;
+  const n = iw * ih;
+  const seen = new Uint8Array(n);
+  const isBg = function (i) {
+    const r = px[i * 4], g = px[i * 4 + 1], b = px[i * 4 + 2];
+    if (px[i * 4 + 3] <= 200) return false;
+    const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+    return mx > 150 && (mx - mn) < 52;
+  };
+  const stack = [];
+  const push = function (i) { if (!seen[i] && isBg(i)) { seen[i] = 1; stack.push(i); } };
+  for (let x = 0; x < iw; x++) { push(x); push((ih - 1) * iw + x); }
+  for (let y = 0; y < ih; y++) { push(y * iw); push(y * iw + iw - 1); }
+  while (stack.length) {
+    const i = stack.pop();
+    px[i * 4 + 3] = 0;
+    const x = i % iw, y = (i / iw) | 0;
+    if (x > 0) push(i - 1);
+    if (x < iw - 1) push(i + 1);
+    if (y > 0) push(i - iw);
+    if (y < ih - 1) push(i + iw);
+  }
+  c2.putImageData(data, 0, 0);
+  // 裁剪透明边距
+  let minX = iw, minY = ih, maxX = -1, maxY = -1;
+  for (let y = 0; y < ih; y++) {
+    for (let x = 0; x < iw; x++) {
+      if (px[(y * iw + x) * 4 + 3] > 8) {
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+  if (maxX < 0) return cv;                       // 整图被抠空（异常图），返回原样
+  minX = Math.max(0, minX - 2);
+  minY = Math.max(0, minY - 2);
+  maxX = Math.min(iw - 1, maxX + 2);
+  maxY = Math.min(ih - 1, maxY + 2);
+  const out = document.createElement("canvas");
+  out.width = maxX - minX + 1;
+  out.height = maxY - minY + 1;
+  out.getContext("2d").drawImage(cv, minX, minY, out.width, out.height, 0, 0, out.width, out.height);
+  return out;
+}
+
+/* 给已抠边的精灵图生成单色着色副本（冰冻/受击闪白），按颜色缓存 */
+function tintedVariant(rec, color) {
+  rec.tints = rec.tints || {};
+  if (rec.tints[color]) return rec.tints[color];
+  const el = rec.el;
+  const cv = document.createElement("canvas");
+  cv.width = el.width; cv.height = el.height;
+  const c2 = cv.getContext("2d");
+  c2.drawImage(el, 0, 0);
+  c2.globalCompositeOperation = "source-atop";
+  c2.fillStyle = color;
+  c2.fillRect(0, 0, cv.width, cv.height);
+  c2.globalCompositeOperation = "source-over";
+  rec.tints[color] = cv;
+  return cv;
+}
+
+function loadAssets() {
+  const keys = Object.keys(ASSETS);
+  return new Promise(function (resolve) {
+    let pending = keys.length;
+    if (!pending) { resolve(); return; }
+    let settled = false;
+    const done = () => { if (settled) return; settled = true; resolve(); };
+    // 极慢的磁盘读取不应阻塞游戏启动
+    const guard = setTimeout(done, 2500);
+    keys.forEach(function (k) {
+      const rec = { ready: false, el: null, cut: !!ASSETS[k].cut, fit: !!ASSETS[k].cut };
+      IMG[k] = rec;
+      const im = new Image();
+      im.onload = function () {
+        rec.ready = true;
+        if (rec.cut) {
+          try {
+            rec.el = hasTransparentBackground(im) ? im : cutoutImage(im);
+          } catch (err) {
+            // file:// 下画布被污染取不到像素：降级为直接绘制原图（带底色方块）
+            console.warn("[资源] %s 抠底失败，使用原图：%s", ASSETS[k].src, err.message);
+            rec.el = im;
+          }
+        } else {
+          rec.el = im;
+        }
+        tick(true);
+      };
+      im.onerror = function () { tick(false); };
+      im.src = ASSETS[k].src;
+      function tick(ok) {
+        if (!ok) missingAssets.push(ASSETS[k].src);
+        pending--;
+        if (pending === 0) {
+          clearTimeout(guard);
+          if (missingAssets.length) {
+            console.info("[资源] 未找到 %d 个图片，已使用占位图形：\n%s",
+              missingAssets.length, missingAssets.join("\n"));
+          }
+          done();
+        }
+      }
+    });
+  });
+}
+
+// 统一取图入口：有图用图，无图按 ASSETS[key].paint 绘制占位
+// 抠边后的角色图等比（contain）缩放居中放入目标框，避免拉伸变形
+function drawSprite(key, cx, cy, w, h, extra) {
+  const rec = IMG[key];
+  const def = ASSETS[key];
+  if (rec && rec.ready) {
+    const el = (extra && extra.tint) ? tintedVariant(rec, extra.tint) : rec.el;
+    let dw = w, dh = h;
+    if (rec.fit) {
+      let s = (def && def.fitMode === "cover")
+        ? Math.max(w / el.width, h / el.height)
+        : Math.min(w / el.width, h / el.height);
+      dw = el.width * s; dh = el.height * s;
+      if ((def && def.fitMode !== "cover") && (dw < w * 0.6 || dh < h * 0.6)) {
+        s = Math.max(w / el.width, h / el.height);
+        dw = el.width * s; dh = el.height * s;
+      }
+    }
+    ctx.drawImage(el, cx - dw / 2, cy - dh / 2, dw, dh);
+    return;
+  }
+  const painter = def && PAINT[def.paint];
+  if (painter) painter(cx, cy, w, h, extra || {});
+}
+
+/* ---------------- 占位绘制：不同颜色/形状保证单位可辨认 ---------------- */
+function ellipse(x, y, rx, ry, color) {
+  ctx.save();
+  ctx.beginPath();
+  ctx.ellipse(x, y, rx, ry, 0, 0, Math.PI * 2);
+  ctx.fillStyle = color;
+  ctx.fill();
+  ctx.restore();
+}
+function eyes(x, y, r, gap, look) {
+  ellipse(x - gap, y, r, r, "#fff");
+  ellipse(x + gap, y, r, r, "#fff");
+  ellipse(x - gap + (look || 0), y, r * 0.46, r * 0.46, "#16211a");
+  ellipse(x + gap + (look || 0), y, r * 0.46, r * 0.46, "#16211a");
+}
+
+const PAINT = {
+  lawn(cx, cy, w, h) {
+    const g = CFG.grid;
+    const lw = g.cols * g.cw, lh = g.rows * g.ch;
+    for (let r = 0; r < g.rows; r++) {
+      for (let c = 0; c < g.cols; c++) {
+        const dark = (r + c) % 2 === 0;
+        ctx.fillStyle = dark ? "#71b055" : "#7dbe5f";
+        ctx.fillRect(g.x + c * g.cw, g.y + r * g.ch, g.cw, g.ch);
+      }
+    }
+    ctx.fillStyle = "rgba(255,255,255,.06)";
+    ctx.fillRect(g.x, g.y, lw, 4);
+  },
+  house(cx, cy, w, h) {
+    ctx.fillStyle = "#3d3327";
+    ctx.fillRect(0, 0, 226, CFG.H);
+    ctx.fillStyle = "#5a4a37";
+    ctx.fillRect(0, 0, 226, 96);
+    ctx.fillStyle = "#6f5b44";
+    for (let y = 110; y < CFG.H; y += 46) ctx.fillRect(10, y, 206, 3);
+    ctx.fillStyle = "#2a2318";
+    ctx.fillRect(16, 210, 194, 300);   // 门洞
+    ctx.fillStyle = "#f6e3a1";
+    ctx.globalAlpha = 0.35;
+    ctx.fillRect(40, 250, 146, 210);
+    ctx.globalAlpha = 1;
+  },
+  sunIcon(cx, cy, w, h) {
+    const r = Math.min(w, h) * 0.34;
+    ctx.strokeStyle = "#f7d24a";
+    ctx.lineWidth = Math.max(2, r * 0.16);
+    for (let i = 0; i < 12; i++) {
+      const a = i / 12 * Math.PI * 2;
+      ctx.beginPath();
+      ctx.moveTo(cx + Math.cos(a) * r * 1.15, cy + Math.sin(a) * r * 1.15);
+      ctx.lineTo(cx + Math.cos(a) * r * 1.55, cy + Math.sin(a) * r * 1.55);
+      ctx.stroke();
+    }
+    ellipse(cx, cy, r, r, "#ffd95e");
+    ellipse(cx, cy, r * 0.7, r * 0.7, "#ffe98a");
+  },
+  cardBg(cx, cy, w, h) {
+    U.roundRect(ctx, cx - w / 2, cy - h / 2, w, h, 9);
+    ctx.fillStyle = "#e7d7ae";
+    ctx.fill();
+    ctx.strokeStyle = "#8d7a4e";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  },
+  shovel(cx, cy, w, h) {
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(-0.24);
+    ctx.lineCap = "round";
+
+    // 木柄：深色轮廓 + 木纹主色 + 左侧高光
+    ctx.strokeStyle = "#4b2c16";
+    ctx.lineWidth = w * 0.18;
+    ctx.beginPath();
+    ctx.moveTo(0, -h * 0.41);
+    ctx.lineTo(0, h * 0.08);
+    ctx.stroke();
+    const wood = ctx.createLinearGradient(-w * 0.06, 0, w * 0.06, 0);
+    wood.addColorStop(0, "#9b6534");
+    wood.addColorStop(0.45, "#d7a15e");
+    wood.addColorStop(1, "#7a4a27");
+    ctx.strokeStyle = wood;
+    ctx.lineWidth = w * 0.11;
+    ctx.beginPath();
+    ctx.moveTo(-1, -h * 0.4);
+    ctx.lineTo(-1, h * 0.07);
+    ctx.stroke();
+    ctx.strokeStyle = "rgba(255,229,178,.55)";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(-3, -h * 0.36);
+    ctx.lineTo(-3, h * 0.02);
+    ctx.stroke();
+
+    // 木柄顶端的握环与金属箍
+    U.roundRect(ctx, -w * 0.13, -h * 0.47, w * 0.26, h * 0.1, 4);
+    ctx.fillStyle = "#6b431f";
+    ctx.fill();
+    const collar = ctx.createLinearGradient(-w * 0.2, 0, w * 0.2, 0);
+    collar.addColorStop(0, "#707b82");
+    collar.addColorStop(0.35, "#eef3f4");
+    collar.addColorStop(0.65, "#9aa6ad");
+    collar.addColorStop(1, "#5a646b");
+    U.roundRect(ctx, -w * 0.18, h * 0.05, w * 0.36, h * 0.13, 3);
+    ctx.fillStyle = collar;
+    ctx.fill();
+    ctx.strokeStyle = "#4b555b";
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    // 圆润倒梯形铲头
+    const metal = ctx.createLinearGradient(-w * 0.25, 0, w * 0.25, 0);
+    metal.addColorStop(0, "#7d8990");
+    metal.addColorStop(0.28, "#e9eef0");
+    metal.addColorStop(0.55, "#b5c0c5");
+    metal.addColorStop(0.8, "#f7f9f8");
+    metal.addColorStop(1, "#68747b");
+    ctx.beginPath();
+    ctx.moveTo(-w * 0.22, h * 0.16);
+    ctx.quadraticCurveTo(-w * 0.31, h * 0.31, -w * 0.15, h * 0.41);
+    ctx.quadraticCurveTo(0, h * 0.49, w * 0.15, h * 0.41);
+    ctx.quadraticCurveTo(w * 0.31, h * 0.31, w * 0.22, h * 0.16);
+    ctx.closePath();
+    ctx.fillStyle = metal;
+    ctx.fill();
+    ctx.strokeStyle = "#465158";
+    ctx.lineWidth = 1.7;
+    ctx.stroke();
+    ctx.strokeStyle = "rgba(255,255,255,.75)";
+    ctx.lineWidth = 1.4;
+    ctx.beginPath();
+    ctx.moveTo(-w * 0.12, h * 0.2);
+    ctx.quadraticCurveTo(-w * 0.16, h * 0.3, -w * 0.05, h * 0.37);
+    ctx.stroke();
+    ctx.restore();
+  },
+  frog(cx, cy, w, h, ex) {
+    const t = ex.t || 0;
+    const breathe = 1 + Math.sin(t * 2.2) * 0.04;
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.scale(1 / breathe, breathe);
+    ellipse(0, h * 0.42, w * 0.34, h * 0.07, "rgba(0,0,0,.25)");
+    // 腿
+    ellipse(-w * 0.27, h * 0.3, w * 0.13, h * 0.1, "#5fa63c");
+    ellipse(w * 0.27, h * 0.3, w * 0.13, h * 0.1, "#5fa63c");
+    // 身体
+    ellipse(0, h * 0.1, w * 0.3, h * 0.24, "#79c552");
+    ellipse(0, h * 0.18, w * 0.22, h * 0.15, "#d9f0b4");
+    // 眼睛
+    ellipse(-w * 0.14, -h * 0.1, w * 0.11, h * 0.1, "#79c552");
+    ellipse(w * 0.14, -h * 0.1, w * 0.11, h * 0.1, "#79c552");
+    eyes(0, -h * 0.1, w * 0.055, w * 0.14, Math.sin(t * 1.4) * 2);
+    // 嘴
+    ctx.strokeStyle = "#3d7a2a";
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(0, h * 0.13, w * 0.13, 0.25, Math.PI - 0.25);
+    ctx.stroke();
+    ctx.restore();
+  },
+  sunflower(cx, cy, w, h) {
+    ctx.strokeStyle = "#4f8f36";
+    ctx.lineWidth = 6;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy + h * 0.1);
+    ctx.lineTo(cx, cy + h * 0.44);
+    ctx.stroke();
+    ellipse(cx + w * 0.18, cy + h * 0.36, w * 0.16, h * 0.05, "#4f8f36");
+    for (let i = 0; i < 10; i++) {
+      const a = i / 10 * Math.PI * 2;
+      ellipse(cx + Math.cos(a) * w * 0.24, cy - h * 0.06 + Math.sin(a) * h * 0.17,
+        w * 0.11, h * 0.07, i % 2 ? "#ffd95e" : "#f7c53f");
+    }
+    ellipse(cx, cy - h * 0.06, w * 0.16, h * 0.14, "#8a5a2b");
+    ellipse(cx, cy - h * 0.08, w * 0.1, h * 0.09, "#a9733b");
+    eyes(cx, cy - h * 0.1, w * 0.04, w * 0.06, 0);
+  },
+  peashooter(cx, cy, w, h) {
+    ctx.strokeStyle = "#4f8f36";
+    ctx.lineWidth = 7;
+    ctx.beginPath();
+    ctx.moveTo(cx - w * 0.05, cy + h * 0.1);
+    ctx.lineTo(cx - w * 0.08, cy + h * 0.42);
+    ctx.stroke();
+    ellipse(cx, cy - h * 0.04, w * 0.24, h * 0.2, "#6fbf4d");
+    ellipse(cx + w * 0.22, cy - h * 0.06, w * 0.13, h * 0.11, "#5aa93f");
+    ellipse(cx + w * 0.3, cy - h * 0.06, w * 0.05, h * 0.07, "#3f7d2c");
+    eyes(cx - w * 0.02, cy - h * 0.12, w * 0.05, w * 0.09, 1);
+  },
+  wallnut(cx, cy, w, h, ex) {
+    const crack = ex.crack || 0;
+    ellipse(cx, cy + h * 0.1, w * 0.3, h * 0.32, "rgba(0,0,0,.22)");
+    ellipse(cx, cy, w * 0.26, h * 0.34, "#b8813f");
+    ellipse(cx - w * 0.06, cy - h * 0.06, w * 0.18, h * 0.22, "#cf9a52");
+    eyes(cx, cy - h * 0.04, w * 0.045, w * 0.09, 0);
+    ctx.strokeStyle = "#5c3c1c";
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(cx, cy + h * 0.1, w * 0.1, 0.2, Math.PI - 0.2);
+    ctx.stroke();
+    if (crack > 0) {
+      ctx.strokeStyle = "#6b4622";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(cx - w * 0.12, cy - h * 0.2);
+      ctx.lineTo(cx + w * 0.04, cy - h * 0.05);
+      ctx.lineTo(cx - w * 0.02, cy + h * 0.12);
+      ctx.stroke();
+    }
+  },
+  snowpea(cx, cy, w, h) {
+    ctx.strokeStyle = "#4f8f36";
+    ctx.lineWidth = 7;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy + h * 0.1);
+    ctx.lineTo(cx, cy + h * 0.42);
+    ctx.stroke();
+    ellipse(cx, cy - h * 0.04, w * 0.24, h * 0.2, "#6ec6e8");
+    ellipse(cx, cy - h * 0.08, w * 0.16, h * 0.13, "#a9e3f8");
+    ellipse(cx + w * 0.23, cy - h * 0.06, w * 0.13, h * 0.11, "#5cb4d8");
+    eyes(cx - w * 0.02, cy - h * 0.12, w * 0.05, w * 0.09, 1);
+    ctx.fillStyle = "#ffffff";
+    ctx.globalAlpha = 0.55;
+    for (let i = 0; i < 4; i++) {
+      ellipse(cx - w * 0.3 + i * w * 0.2, cy + h * 0.2 + (i % 2) * 6, 3, 3, "#fff");
+    }
+    ctx.globalAlpha = 1;
+  },
+  cherry(cx, cy, w, h, ex) {
+    const pulse = ex.pulse || 1;
+    const r = w * 0.2 * pulse;
+    ctx.strokeStyle = "#4f8f36";
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy - h * 0.24);
+    ctx.quadraticCurveTo(cx + w * 0.12, cy - h * 0.32, cx + w * 0.16, cy - h * 0.18);
+    ctx.stroke();
+    ellipse(cx - w * 0.16, cy + h * 0.06, r, r, "#d94b4b");
+    ellipse(cx + w * 0.16, cy + h * 0.06, r, r, "#e85c5c");
+    eyes(cx - w * 0.16, cy + h * 0.04, r * 0.22, r * 0.3, 0);
+    eyes(cx + w * 0.16, cy + h * 0.04, r * 0.22, r * 0.3, 0);
+  },
+  potato(cx, cy, w, h, ex) {
+    const armed = ex.armed !== false;
+    ellipse(cx, cy + h * 0.28, w * 0.28, h * 0.08, "rgba(0,0,0,.25)");
+    ellipse(cx, cy + h * 0.12, w * 0.25, h * 0.16, "#a9793f");
+    ellipse(cx - w * 0.06, cy + h * 0.06, w * 0.16, h * 0.1, "#c08f52");
+    if (armed) {
+      ellipse(cx, cy + h * 0.1, w * 0.1, h * 0.06, "#e0563f");
+      eyes(cx, cy + h * 0.08, w * 0.03, w * 0.07, 0);
+    } else {
+      ctx.fillStyle = "#8a5f30";
+      ctx.fillRect(cx - w * 0.1, cy + h * 0.04, w * 0.2, 4);
+    }
+  },
+  pea(cx, cy, w, h, ex) {
+    const frozen = ex.frozen;
+    ctx.fillStyle = frozen ? "#8fd8f2" : "#6fbf4d";
+    ctx.beginPath();
+    ctx.arc(cx, cy, w * 0.42, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = frozen ? "#d8f4ff" : "#9fdb7c";
+    ctx.beginPath();
+    ctx.arc(cx - w * 0.1, cy - h * 0.12, w * 0.16, 0, Math.PI * 2);
+    ctx.fill();
+  },
+  zombie(cx, cy, w, h, ex) {
+    const step = Math.sin((ex.t || 0) * 6) * 3;
+    // 腿
+    ctx.fillStyle = "#4b5a3d";
+    ctx.fillRect(cx - w * 0.16, cy + h * 0.12 + step, w * 0.1, h * 0.22);
+    ctx.fillRect(cx + w * 0.06, cy + h * 0.12 - step, w * 0.1, h * 0.22);
+    // 身体
+    U.roundRect(ctx, cx - w * 0.18, cy - h * 0.06, w * 0.36, h * 0.24, 8);
+    ctx.fillStyle = "#6d8560";
+    ctx.fill();
+    // 手臂
+    ctx.fillStyle = "#7f9d6a";
+    ctx.fillRect(cx + w * 0.1, cy - h * 0.02, w * 0.22, h * 0.05);
+    // 头
+    ellipse(cx, cy - h * 0.2, w * 0.19, h * 0.13, "#93ad7f");
+    ctx.fillStyle = "#16211a";
+    ctx.fillRect(cx - w * 0.11, cy - h * 0.24, w * 0.05, h * 0.035);
+    ctx.fillRect(cx + w * 0.04, cy - h * 0.24, w * 0.05, h * 0.035);
+    ctx.fillStyle = "#3c4b31";
+    ctx.fillRect(cx - w * 0.09, cy - h * 0.15, w * 0.18, h * 0.02);
+    if (ex.hurtFlash) {
+      ctx.globalAlpha = 0.5;
+      ellipse(cx, cy - h * 0.1, w * 0.28, h * 0.28, "#fff");
+      ctx.globalAlpha = 1;
+    }
+    if (ex.frozenT > 0) {
+      ctx.globalAlpha = 0.35;
+      ellipse(cx, cy - h * 0.05, w * 0.3, h * 0.3, "#7fd4f5");
+      ctx.globalAlpha = 1;
+    }
+  },
+  zombieCone(cx, cy, w, h, ex) {
+    PAINT.zombie(cx, cy, w, h, ex);
+    ctx.fillStyle = "#e07a2c";
+    ctx.beginPath();
+    ctx.moveTo(cx - w * 0.14, cy - h * 0.28);
+    ctx.lineTo(cx + w * 0.14, cy - h * 0.28);
+    ctx.lineTo(cx, cy - h * 0.42);
+    ctx.closePath();
+    ctx.fill();
+  },
+  zombieBucket(cx, cy, w, h, ex) {
+    PAINT.zombie(cx, cy, w, h, ex);
+    ctx.fillStyle = "#9aa4ab";
+    U.roundRect(ctx, cx - w * 0.17, cy - h * 0.42, w * 0.34, h * 0.14, 3);
+    ctx.fill();
+    ctx.strokeStyle = "#6f787e";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  },
+  zombiePole(cx, cy, w, h, ex) {
+    PAINT.zombie(cx, cy, w, h, ex);
+    ctx.strokeStyle = "#c9a26a";
+    ctx.lineWidth = 5;
+    ctx.beginPath();
+    ctx.moveTo(cx + w * 0.4, cy + h * 0.18);
+    ctx.lineTo(cx + w * 0.1, cy - h * 0.4);
+    ctx.stroke();
+    ctx.fillStyle = "#d6d6d6";
+    ctx.fillRect(cx - w * 0.06, cy - h * 0.3, w * 0.26, h * 0.03);
+  },
+  boom(cx, cy, w, h, ex) {
+    const p = ex.p || 1;
+    const colors = ["#fff2b0", "#ffc649", "#f2822a", "#d9471f"];
+    for (let i = 0; i < 4; i++) {
+      const rr = w * (0.18 + i * 0.1) * p;
+      ctx.globalAlpha = 0.9 - i * 0.18;
+      ellipse(cx, cy, rr, rr * 0.92, colors[i]);
+    }
+    ctx.globalAlpha = 1;
+  }
+};
+
+/* ---------------------------------------------------------------------
+   [5] 核心：画布、状态机、输入、网格、阳光与卡片系统
+   --------------------------------------------------------------------- */
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+
+function fitCanvas() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const cw = Math.max(480, Math.min(window.innerWidth, window.innerHeight * (CFG.W / CFG.H)));
+  const ch = cw * CFG.H / CFG.W;
+  canvas.style.width = cw + "px";
+  canvas.style.height = ch + "px";
+  canvas.width = Math.round(cw * dpr);
+  canvas.height = Math.round(ch * dpr);
+  const scale = (cw * dpr) / CFG.W;
+  ctx.setTransform(scale, 0, 0, scale, 0, 0);
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+}
+fitCanvas();
+window.addEventListener("resize", fitCanvas);
+
+function cellCX(col) { return CFG.grid.x + col * CFG.grid.cw + CFG.grid.cw / 2; }
+function cellCY(row) { return CFG.grid.y + row * CFG.grid.ch + CFG.grid.ch / 2; }
+function cellCol(x) { return Math.floor((x - CFG.grid.x) / CFG.grid.cw); }
+function cellRow(y) { return Math.floor((y - CFG.grid.y) / CFG.grid.ch); }
+function inGrid(x, y) {
+  return x >= CFG.grid.x && x < CFG.grid.x + CFG.grid.cols * CFG.grid.cw &&
+         y >= CFG.grid.y && y < CFG.grid.y + CFG.grid.rows * CFG.grid.ch;
+}
+
+const Game = {
+  state: "BOOT",
+  t: 0,
+  time: 0,              // 本局战斗时长（出怪导演依据）
+  sun: 0,
+  sunFallTimer: 0,
+  plants: [],
+  zombies: [],
+  projectiles: [],
+  suns: [],
+  effects: [],
+  mowers: [],
+  cards: [],
+  selected: -1,          // 选中的卡片槽位
+  shovel: false,         // 铲子模式
+  waveCount: 0,          // 已生成的波数
+  waveTimer: 0,
+  kills: 0,
+  hover: { col: -1, row: -1 },
+  tip: { kind: "", ref: null, t: 0, visible: false, layout: null },
+  almanac: { tab: "plants", page: 0 },
+  modifiers: createDefaultModifiers(),
+  buffState: createDefaultBuffState(),
+  campaign: null,
+  campaignUnlocked: 0,
+  story: null,
+  rps: { playerChoice: -1, dragonChoice: -1, result: "", showResult: false },
+  msg: null,             // {text, life}
+  mouse: { x: -100, y: -100 },
+  shake: 0,
+  paused: false,
+  stats: { fps: 0, acc: 0, frames: 0 }
+};
+
+function setState(next) {
+  Game.state = next;
+  Game.msg = null;
+  clearTip();
+  Game.paused = next === "PAUSED";
+}
+
+/* 清空实体：任何状态切换都不残留对象与计时器 */
+function clearWorld() {
+  Game.plants.length = 0;
+  Game.zombies.length = 0;
+  Game.projectiles.length = 0;
+  Game.suns.length = 0;
+  Game.effects.length = 0;
+  Game.mowers.length = 0;
+  Game.cards.length = 0;
+  Game.selected = -1;
+  Game.shovel = false;
+  Game.time = 0;
+  Game.waveCount = 0;
+  Game.waveTimer = CFG.director.firstDelay;
+  Game.spawnQ = [];
+  Game.rings = [];
+  Game.round = 1;
+  Game.hpMul = 1;
+  Game.countMul = 1;
+  Game.kills = 0;
+  Game.sunFallTimer = CFG.sun.fallFirst;
+  Game.shake = 0;
+  Game.campaign = null;
+  Game.story = null;
+  Game.modifiers = createDefaultModifiers();
+  Game.buffState = createDefaultBuffState();
+}
+
+function setupBattle() {
+  Game.sun = CFG.sun.start;
+  Object.keys(PLANTS).forEach(function (key, i) {
+    Game.cards.push({ key: key, slot: i, cd: 0, maxCd: 0, flash: 0 });
+  });
+  for (let r = 0; r < CFG.grid.rows; r++) {
+    Game.mowers.push({
+      row: r, x: CFG.mower.x, used: false, running: false,
+      y: cellCY(r) + 26
+    });
+  }
+}
+
+function loadCampaignUnlocked() {
+  try {
+    const value = parseInt(localStorage.getItem(CAMPAIGN_SAVE_KEY), 10);
+    return isNaN(value) ? 0 : U.clamp(value, 0, CAMPAIGN.length - 1);
+  } catch (err) {
+    return 0;
+  }
+}
+
+function saveCampaignUnlocked(levelId) {
+  const next = Math.min(CAMPAIGN.length - 1, levelId + 1);
+  if (next <= Game.campaignUnlocked) return;
+  Game.campaignUnlocked = next;
+  try { localStorage.setItem(CAMPAIGN_SAVE_KEY, String(next)); } catch (err) {}
+}
+
+function openBuffRoll() {
+  if (Game.campaign || Game.state !== "PLAYING") return;
+  const ids = Object.keys(BUFFS);
+  for (let i = ids.length - 1; i > 0; i--) {
+    const j = U.randInt(0, i);
+    const tmp = ids[i]; ids[i] = ids[j]; ids[j] = tmp;
+  }
+  Game.modifiers = createDefaultModifiers();
+  Game.buffState = createDefaultBuffState();
+  Game.buffState.choices = ids.slice(0, 1);
+  Game.buffState.layouts = Game.buffState.choices.map(function (id) {
+    return wrapTipText(BUFFS[id].desc, 244, "14px 'Microsoft YaHei', sans-serif");
+  });
+  Game.buffState.nextRollRound = Game.round;
+  setState("ROLL");
+}
+
+function applyBuff(buffId) {
+  if (Game.state !== "ROLL" || Game.buffState.choices.indexOf(buffId) < 0) return;
+  const buff = BUFFS[buffId];
+  buff.apply();
+  Game.buffState.activeId = buffId;
+  Game.buffState.activeName = buff.name;
+  Game.buffState.remainingRounds = 3;
+  Game.buffState.nextRollRound = Game.round + 3;
+  setState("PLAYING");
+  Game.msg = { text: "系统微调：" + buff.name + "（3 回合）", life: 2.4 };
+}
+
+function showStory(lines, onEnd) {
+  Game.story = { lines: lines, index: 0, onEnd: onEnd, layout: [] };
+  setState("STORY");
+  prepareStoryLine();
+}
+
+function prepareStoryLine() {
+  if (!Game.story || !Game.story.lines[Game.story.index]) return;
+  Game.story.layout = wrapTipText(Game.story.lines[Game.story.index].text,
+    720, "18px 'Microsoft YaHei', sans-serif");
+}
+
+function advanceStory() {
+  if (Game.state !== "STORY" || !Game.story) return;
+  Game.story.index++;
+  if (Game.story.index < Game.story.lines.length) {
+    prepareStoryLine();
+    return;
+  }
+  const onEnd = Game.story.onEnd;
+  Game.story = null;
+  if (onEnd) onEnd();
+}
+
+/* 无尽模式：不设胜负关卡，由出怪导演按对局时长渐进难度 */
+function startEndless() {
+  clearWorld();
+  setupBattle();
+  setState("INTRO");
+}
+
+function startCampaign(levelId) {
+  if (levelId < 0 || levelId >= CAMPAIGN.length || levelId > Game.campaignUnlocked) return;
+  const level = CAMPAIGN[levelId];
+  clearWorld();
+  setupBattle();
+  Game.campaign = { levelId: levelId, wave: 0, maxWave: level.waveLimit };
+  const storyLines = levelId === 0
+    ? [{ speaker: "奶龙", text: STORY.intro.lines[0] }].concat(level.preStory)
+    : level.preStory;
+  showStory(storyLines, function () {
+    setState("PLAYING");
+    Game.msg = { text: level.title + " · 第 1 / " + level.waveLimit + " 波", life: 2.6 };
+  });
+}
+
+function beginBattle() {
+  if (Game.state !== "INTRO") return;
+  setState("PLAYING");
+  Game.msg = { text: "无尽模式 · 第 1 轮", life: 2.6 };
+}
+
+function cardRect(i) {
+  const c = CFG.cards;
+  return { x: c.x + i * (c.w + c.gap), y: c.y, w: c.w, h: c.h };
+}
+function pointIn(x, y, r) {
+  return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
+}
+
+/* ---------------- 统一角色说明浮窗 ---------------- */
+const TIP_DELAY = 0.4;
+const TIP_WIDTH = 320;
+const TIP_PAD = 14;
+
+function wrapTipText(text, maxWidth, font) {
+  ctx.save();
+  ctx.font = font;
+  const lines = [];
+  let line = "";
+  for (const ch of String(text || "")) {
+    if (line && ctx.measureText(line + ch).width > maxWidth) {
+      lines.push(line);
+      line = ch;
+    } else {
+      line += ch;
+    }
+  }
+  if (line) lines.push(line);
+  ctx.restore();
+  return lines;
+}
+
+function buildTipLayout(def) {
+  const info = def.info || { role: "", skill: def.desc || "", stats: [] };
+  const lore = def.lore || { tag: "" };
+  const bodyFont = "14px 'Microsoft YaHei', sans-serif";
+  const statFont = "12px 'Microsoft YaHei', sans-serif";
+  const roleLines = wrapTipText("定位 · " + info.role, TIP_WIDTH - TIP_PAD * 2, bodyFont);
+  const skillLines = wrapTipText("技能 · " + (info.skill || def.desc || ""), TIP_WIDTH - TIP_PAD * 2, bodyFont);
+  const statLines = wrapTipText("数值 · " + info.stats.join(" · "), TIP_WIDTH - TIP_PAD * 2, statFont);
+  return {
+    title: def.name,
+    tag: lore.tag,
+    roleLines: roleLines,
+    skillLines: skillLines,
+    statLines: statLines,
+    bodyFont: bodyFont,
+    statFont: statFont,
+    height: TIP_PAD + 24 + 17 + roleLines.length * 18 + 4 + skillLines.length * 18 +
+      6 + 1 + 7 + statLines.length * 16 + 12
+  };
+}
+
+function cardAtPointer(x, y) {
+  for (let i = 0; i < Game.cards.length; i++) {
+    if (pointIn(x, y, cardRect(i))) return i;
+  }
+  return -1;
+}
+
+function plantAtPointer(x, y) {
+  for (let i = Game.plants.length - 1; i >= 0; i--) {
+    const p = Game.plants[i];
+    if (!p.dead && Math.abs(x - p.x) <= 52 && Math.abs(y - p.y) <= 59) return p;
+  }
+  return null;
+}
+
+function zombieAtPointer(x, y) {
+  for (let i = Game.zombies.length - 1; i >= 0; i--) {
+    const z = Game.zombies[i];
+    if (z.dead) continue;
+    if (Math.abs(x - z.x) <= 52 && Math.abs(y - cellCY(z.row)) <= 78) return z;
+  }
+  return null;
+}
+
+function setTip(kind, ref) {
+  const tip = Game.tip;
+  if (tip.kind === kind && tip.ref === ref) return;
+  tip.kind = kind || "";
+  tip.ref = ref === undefined || ref === null ? null : ref;
+  tip.t = 0;
+  tip.visible = false;
+  let def = null;
+  if (kind === "card" && Game.cards[ref]) def = PLANTS[Game.cards[ref].key];
+  else if ((kind === "plant" || kind === "zombie") && ref) def = ref.def;
+  tip.layout = def ? buildTipLayout(def) : null;
+}
+
+function clearTip() {
+  setTip("", null);
+}
+
+function tipTargetAlive() {
+  const tip = Game.tip;
+  if (tip.ref === null || tip.ref === undefined) return false;
+  if (tip.kind === "card") return !!Game.cards[tip.ref];
+  if (tip.kind === "plant") {
+    return !tip.ref.dead && Game.plants.indexOf(tip.ref) >= 0;
+  }
+  if (tip.kind === "zombie") {
+    return !tip.ref.dead && Game.zombies.indexOf(tip.ref) >= 0;
+  }
+  return false;
+}
+
+function updateTip(dt) {
+  const tip = Game.tip;
+  if (tip.ref === null || tip.ref === undefined) return;
+  if (!tipTargetAlive()) { clearTip(); return; }
+  if (tip.visible) return;
+  tip.t += dt;
+  if (tip.t >= TIP_DELAY) tip.visible = true;
+}
+
+/* ---------------- 阳光系统 ---------------- */
+function spawnFallingSun() {
+  const g = CFG.grid;
+  const x = U.rand(g.x + 30, g.x + g.cols * g.cw - 30);
+  const ty = U.rand(g.y + 40, g.y + g.rows * g.ch - 30);
+  Game.suns.push({ x: x, y: -28, targetY: ty, state: "fall", life: CFG.sun.life, t: 0, from: null });
+}
+function spawnPlantSun(plant) {
+  Game.suns.push({
+    x: plant.x, y: plant.y - 6, targetY: plant.y + 14,
+    state: "fall", life: CFG.sun.life, t: 0, from: "plant"
+  });
+}
+function collectSun(s) {
+  if (s.state === "collect") return;
+  s.state = "collect";
+  s.t = 0;
+}
+
+/* ---------------- 卡片与放置 ---------------- */
+function cardUsable(card) {
+  const def = PLANTS[card.key];
+  return card.cd <= 0 && Game.sun >= def.cost;
+}
+function trySelectSlot(i) {
+  if (i < 0 || i >= Game.cards.length) return;
+  if (Game.cards[i].cd > 0) return;
+  Game.shovel = false;
+  Game.selected = Game.selected === i ? -1 : i;
+}
+function placePlant(col, row) {
+  if (Game.selected < 0) return false;
+  const card = Game.cards[Game.selected];
+  const def = PLANTS[card.key];
+  if (!cardUsable(card)) return false;
+  const occupied = Game.plants.some(function (p) { return p.col === col && p.row === row; });
+  if (occupied) return false;
+  Game.sun -= def.cost;
+  const plantCdMul = Game.modifiers.plantCdMul[card.key] || 1;
+  card.maxCd = def.recharge * Game.modifiers.cdMul * plantCdMul;
+  card.cd = card.maxCd;
+  Game.plants.push({
+    key: card.key, def: def, col: col, row: row,
+    x: cellCX(col), y: cellCY(row),
+    hp: def.hp, maxHp: def.hp, paidCost: def.cost,
+    timer: 0, fired: 0, fuse: def.fuse || 0,
+    laugh: 0, ringT: 0,   // 寒冰龙技能：捧腹大笑计时与光圈节奏
+    burstQ: 0, burstT: 0, // 奶狗技能：连射剩余发数与间隔计时
+    armed: 0, dead: false, hurt: 0, t: Math.random() * 6,
+    // 动画计时器：开火后坐、产阳光跳跃、布雷起身、入场缩放
+    recoil: 0, hop: 0, pop: 0, born: 0.35
+  });
+  if (def.sfx) playSfx(def.sfx);   // 种植音效（如寒冰菇）
+  return true;
+}
+function removePlantAt(col, row) {
+  const idx = Game.plants.findIndex(function (p) {
+    return p.col === col && p.row === row && !p.dead;
+  });
+  if (idx >= 0) {
+    const plant = Game.plants[idx];
+    plant.dead = true;
+    Game.sun += plant.paidCost;
+    return true;
+  }
+  return false;
+}
+
+/* ---------------- 输入 ---------------- */
+function toLogical(e) {
+  const r = canvas.getBoundingClientRect();
+  return {
+    x: (e.clientX - r.left) * CFG.W / r.width,
+    y: (e.clientY - r.top) * CFG.H / r.height
+  };
+}
+
+function trackPointer(x, y) {
+  Game.mouse.x = x;
+  Game.mouse.y = y;
+  if (inGrid(x, y)) {
+    Game.hover.col = cellCol(x);
+    Game.hover.row = cellRow(y);
+  } else {
+    Game.hover.col = -1;
+    Game.hover.row = -1;
+  }
+  let kind = "", ref = null;
+  if (Game.state === "PLAYING" && !Game.paused) {
+    const cardIndex = cardAtPointer(x, y);
+    if (cardIndex >= 0) {
+      kind = "card"; ref = cardIndex;
+    } else {
+      const plant = plantAtPointer(x, y);
+      if (plant) {
+        kind = "plant"; ref = plant;
+      } else {
+        const zombie = zombieAtPointer(x, y);
+        if (zombie) { kind = "zombie"; ref = zombie; }
+      }
+    }
+  }
+  setTip(kind, ref);
+}
+
+const touchState = { active: false, x: 0, y: 0, started: 0, moved: false };
+let suppressMouseUntil = 0;
+
+canvas.addEventListener("mousemove", function (e) {
+  if (performance.now() < suppressMouseUntil) return;
+  const p = toLogical(e);
+  trackPointer(p.x, p.y);
+});
+canvas.addEventListener("mouseleave", function () {
+  Game.hover.col = -1; Game.hover.row = -1;
+  Game.mouse.x = -100; Game.mouse.y = -100;
+  clearTip();
+});
+canvas.addEventListener("contextmenu", function (e) {
+  e.preventDefault();
+  Game.selected = -1;
+  Game.shovel = false;
+});
+canvas.addEventListener("mousedown", function (e) {
+  if (e.button !== 0) return;
+  if (performance.now() < suppressMouseUntil) return;
+  const p = toLogical(e);
+  handleClick(p.x, p.y);
+});
+
+canvas.addEventListener("touchstart", function (e) {
+  e.preventDefault();
+  suppressMouseUntil = performance.now() + 700;
+  if (e.touches.length !== 1) {
+    touchState.active = false;
+    clearTip();
+    return;
+  }
+  const p = toLogical(e.touches[0]);
+  touchState.active = true;
+  touchState.x = p.x;
+  touchState.y = p.y;
+  touchState.started = performance.now();
+  touchState.moved = false;
+  trackPointer(p.x, p.y);
+}, { passive: false });
+
+canvas.addEventListener("touchmove", function (e) {
+  if (!touchState.active) return;
+  e.preventDefault();
+  const t = e.touches[0];
+  if (!t) return;
+  const p = toLogical(t);
+  if (Math.hypot(p.x - touchState.x, p.y - touchState.y) > 12) {
+    touchState.moved = true;
+    clearTip();
+  }
+}, { passive: false });
+
+canvas.addEventListener("touchend", function (e) {
+  if (!touchState.active) return;
+  e.preventDefault();
+  suppressMouseUntil = performance.now() + 700;
+  const isTap = !touchState.moved && performance.now() - touchState.started < TIP_DELAY * 1000;
+  const x = touchState.x, y = touchState.y;
+  touchState.active = false;
+  Game.hover.col = -1;
+  Game.hover.row = -1;
+  clearTip();
+  if (isTap) handleClick(x, y);
+}, { passive: false });
+
+canvas.addEventListener("touchcancel", function () {
+  touchState.active = false;
+  touchState.moved = true;
+  clearTip();
+});
+
+window.addEventListener("keydown", function (e) {
+  const k = e.key;
+  if (Game.state === "INTRO" && (k === "Enter" || k === " ")) {
+    beginBattle();
+    return;
+  }
+  if (Game.state === "ALMANAC" && k === "Escape") {
+    closeAlmanac();
+    return;
+  }
+  if (Game.state === "PLAYING") {
+    if (k >= "1" && k <= "9") trySelectSlot(parseInt(k) - 1);
+    if (k === "Escape") { Game.selected = -1; Game.shovel = false; }
+    if (k === "p" || k === "P") togglePause();
+    if (k === "s" || k === "S") { Game.shovel = !Game.shovel; Game.selected = -1; }
+  }
+  if (k === "d" || k === "D") CFG.debug = !CFG.debug;
+});
+
+/* ---------------------------------------------------------------------
+   [6] 实体：植物、僵尸、投射物、割草机
+   --------------------------------------------------------------------- */
+const PROJ_SPEED = 430;
+
+function spawnZombie(key, row) {
+  const d = ZOMBIES[key];
+  Game.zombies.push({
+    key: key, def: d, row: row,
+    x: CFG.zombie.spawnX + U.rand(-16, 16),
+    hp: Math.round(d.hp * (Game.hpMul || 1)), maxHp: Math.round(d.hp * (Game.hpMul || 1)),
+    speed: d.speed * (CFG.zombie.speedScale || 1), eating: false,
+    frozenT: 0, iceT: 0, hurt: 0, dead: false, deathT: 0,
+    vaulted: !d.vault, t: Math.random() * 5, jump: 0, biteT: 0
+  });
+}
+
+/* 各角色攻击特效的粒子配色（按 anim 风格索引） */
+const BITE_FX = {
+  waddle: ["#9fc6ff", "#dceaff"], float: ["#c9a6ff", "#f0d8ff"],
+  heavy: ["#cfd6dc", "#aeb8c2", "#ffffff"], march: ["#8f7fe0", "#5a4fae"],
+  swing: ["#d8b25a", "#f0e0b0", "#ffffff"], waddleBig: ["#e0a05a", "#fff0d0"],
+  glide: ["#8a93b8", "#c0c8e0"]
+};
+
+function plantInFront(row, zx) {
+  let best = null;
+  for (const p of Game.plants) {
+    if (p.row !== row || p.dead) continue;
+    const gap = zx - p.x;
+    if (gap >= -26 && gap <= CFG.zombie.contactGap) {
+      if (!best || p.x > best.x) best = p;
+    }
+  }
+  return best;
+}
+
+/* 粒子发射器：opts = { colors, spMin, spMax, grav, up, lifeMin, lifeMax, sMin, sMax } */
+function addParticles(x, y, n, opts) {
+  for (let i = 0; i < n; i++) {
+    const a = U.rand(0, Math.PI * 2);
+    const sp = U.rand(opts.spMin || 40, opts.spMax || 160);
+    Game.effects.push({
+      kind: "p", x: x, y: y,
+      vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - (opts.up || 0),
+      grav: opts.grav === undefined ? 320 : opts.grav,
+      life: U.rand(opts.lifeMin || 0.3, opts.lifeMax || 0.6), t: 0,
+      size: U.rand(opts.sMin || 2, opts.sMax || 5),
+      color: opts.colors[U.randInt(0, opts.colors.length - 1)]
+    });
+  }
+}
+
+function explode(cx, cy, row, radius, damage) {
+  const actualDamage = damage * Game.modifiers.atkMul;
+  Game.effects.push({ x: cx, y: cy, t: 0, life: 0.55, kind: "boom" });
+  Game.effects.push({ x: cx, y: cy, t: 0, life: 0.4, kind: "ring", r0: 20, r1: 150, color: "#ffe9a0" });
+  addParticles(cx, cy, 18, { colors: ["#ffd95e", "#f2822a", "#e8b04a", "#fff2b0"], spMin: 90, spMax: 260, lifeMin: 0.35, lifeMax: 0.7, sMin: 3, sMax: 7 });
+  Game.shake = 10;
+  for (const z of Game.zombies) {
+    if (z.dead) continue;
+    const rowGap = Math.abs(z.row - row);
+    const xGap = Math.abs(z.x - cx);
+    if (rowGap <= radius && xGap <= CFG.grid.cw * radius + 20) {
+      z.hp -= actualDamage;
+      z.hurt = 0.18;
+    }
+  }
+}
+
+/* 寒冰菇爆炸：全场僵尸冻结（不移动不啃食）+ 少量伤害 + 冰环特效 */
+function freezeField(p) {
+  for (const z of Game.zombies) {
+    if (z.dead) continue;
+    z.hp -= p.def.damage * Game.modifiers.atkMul;
+    z.hurt = 0.18;
+    z.iceT = p.def.freezeDur;      // 完全冻结
+    z.frozenT = p.def.freezeDur + 2.5;   // 冻结结束后保留 2.5 秒减速尾巴
+    if (z.hp <= 0) killZombie(z);
+  }
+  Game.effects.push({ x: p.x, y: p.y, t: 0, life: 0.6, kind: "ring", r0: 24, r1: 760, color: "#bfeaff" });
+  Game.effects.push({ x: p.x, y: p.y, t: 0, life: 0.4, kind: "ring", r0: 12, r1: 380, color: "#e6f9ff" });
+  addParticles(p.x, p.y, 24, { colors: ["#bfeaff", "#e6f9ff", "#7fd4f5", "#fff"], spMin: 90, spMax: 330, grav: 140, lifeMin: 0.35, lifeMax: 0.85, sMin: 2, sMax: 6 });
+  Game.shake = 8;
+}
+
+/* 奶鸡技能：向外扩散的阳光环，扫过僵尸即造成伤害（同一环对每只只命中一次），
+   半径覆盖全地图 */
+function spawnMilkRing(p, delay) {
+  Game.rings.push({ x: p.x, y: p.y - 6, r: 14, delay: delay || 0,
+    speed: 400, maxR: 1500,
+    damage: (p.def.ringDamage || 30) * Game.modifiers.atkMul, hit: [] });
+}
+function updateRings(dt) {
+  for (const g of Game.rings) {
+    if (g.delay > 0) { g.delay -= dt; continue; }
+    g.r += g.speed * dt;
+    for (const z of Game.zombies) {
+      if (z.dead || g.hit.indexOf(z) >= 0) continue;
+      if (Math.abs(Math.hypot(z.x - g.x, cellCY(z.row) - g.y) - g.r) < 18) {
+        g.hit.push(z);
+        z.hp -= g.damage;
+        z.hurt = 0.16;
+        addParticles(z.x, cellCY(z.row) - 24, 6, { colors: ["#fff6dc", "#ffe98a", "#f2c94c"], spMin: 40, spMax: 130, grav: 220, lifeMin: 0.2, lifeMax: 0.45, sMin: 2, sMax: 4 });
+        if (z.hp <= 0) killZombie(z);
+      }
+    }
+  }
+  Game.rings = Game.rings.filter(function (g) { return g.delay > 0 || g.r < g.maxR; });
+}
+
+function fireProjectile(plant, pierce) {
+  const frozen = plant.def.proj === "frozen";
+  const mx = plant.x + 30, my = plant.y - 22;
+  Game.projectiles.push({
+    x: mx, y: my, row: plant.row,
+    vx: PROJ_SPEED, damage: plant.def.damage * Game.modifiers.atkMul,
+    frozen: frozen, freeze: plant.def.freeze || 0, dead: false, t: 0,
+    pierce: !!pierce, hitSet: pierce ? [] : null
+  });
+  // 攻击动画：后坐 + 枪口闪光；寒冰附带冰晶粒子；穿透弹黄色枪口与拖尾
+  plant.recoil = 0.22;
+  Game.effects.push({ x: mx, y: my, t: 0, life: 0.13, kind: "muzzle",
+    color: pierce ? "#ffe27a" : (frozen ? "#bfeaff" : "#eafcc8") });
+  if (frozen) {
+    addParticles(mx, my, 4, { colors: ["#bfeaff", "#e6f9ff", "#8fd8f2"], spMin: 20, spMax: 70, grav: 60, lifeMin: 0.25, lifeMax: 0.5, sMin: 2, sMax: 4 });
+  }
+}
+
+function updatePlants(dt) {
+  for (const p of Game.plants) {
+    p.t += dt;
+    if (p.hurt > 0) p.hurt -= dt;
+    if (p.recoil > 0) p.recoil -= dt;
+    if (p.hop > 0) p.hop -= dt;
+    if (p.pop > 0) p.pop -= dt;
+    if (p.born > 0) p.born -= dt;
+    if (p.laugh > 0) {
+      // 捧腹大笑：持续期内周期性向外扩散黄色光圈
+      p.laugh -= dt;
+      p.ringT += dt;
+      if (p.ringT >= 0.28) {
+        p.ringT = 0;
+        Game.effects.push({ x: p.x, y: p.y - 8, t: 0, life: 0.5, kind: "ring", r0: 16, r1: 130, color: "#ffd84a" });
+      }
+    }
+    const def = p.def;
+
+    if (def.kind === "bomb") {
+      p.fuse -= dt;
+      if (p.fuse <= 0) {
+        explode(p.x, p.y, p.row, def.radius, def.damage);
+        p.dead = true;
+      }
+      continue;
+    }
+
+    if (def.kind === "icebomb") {
+      p.fuse -= dt;
+      if (p.fuse <= 0) {
+        freezeField(p);
+        p.dead = true;
+      }
+      continue;
+    }
+
+    if (def.kind === "mine") {
+      const wasArmed = p.armed >= def.armTime;
+      p.armed += dt;
+      if (!wasArmed && p.armed >= def.armTime) {
+        p.pop = 0.45;   // 起身动画
+        addParticles(p.x, p.y + 20, 8, { colors: ["#d9c9a0", "#c0a878"], spMin: 30, spMax: 90, grav: 260, lifeMin: 0.25, lifeMax: 0.5, sMin: 2, sMax: 4 });
+      }
+      if (p.armed >= def.armTime) {
+        const z = Game.zombies.find(function (z) {
+          return !z.dead && z.row === p.row && Math.abs(z.x - p.x) < 62;
+        });
+        if (z) {
+          explode(p.x, p.y, p.row, def.radius, def.damage);
+          p.dead = true;
+        }
+      }
+      continue;
+    }
+
+    if (def.kind === "producer") {
+      p.timer += dt;
+      if (p.timer >= def.produceInterval) {
+        p.timer = 0;
+        spawnPlantSun(p);
+        p.fired++;
+        p.hop = 0.5;    // 下蛋后跳一下
+        Game.effects.push({ x: p.x, y: p.y - 10, t: 0, life: 0.35, kind: "ring", r0: 10, r1: 46, color: "#ffe98a" });
+        addParticles(p.x, p.y - 6, 6, { colors: ["#ffe98a", "#fff6c8", "#f2c94c"], spMin: 30, spMax: 90, grav: 160, up: 40, lifeMin: 0.3, lifeMax: 0.55, sMin: 2, sMax: 4 });
+        if (def.ringEvery && p.fired % def.ringEvery === 0) {
+          // 技能：先后发射两圈奶蛋波，波及到的僵尸受伤
+          spawnMilkRing(p, 0);
+          spawnMilkRing(p, 0.4);
+          playSfx("niganma");
+        }
+      }
+      continue;
+    }
+
+    if (def.kind === "shooter") {
+      // 只有本行前方存在僵尸才开火，避免无意义弹药
+      const hasTarget = Game.zombies.some(function (z) {
+        return !z.dead && z.row === p.row && z.x > p.x - 10;
+      });
+      if (p.burstQ > 0) {
+        // 连射进行中：按固定间隔补完剩余穿透弹
+        p.burstT -= dt;
+        if (p.burstT <= 0) {
+          p.burstT = 0.12;
+          p.burstQ--;
+          fireProjectile(p, true);
+        }
+      } else if (hasTarget) {
+        p.timer += dt;
+        if (p.timer >= def.fireInterval) {
+          p.timer = 0;
+          p.fired++;
+          const burst = def.burstEvery && p.fired % def.burstEvery === 0;
+          fireProjectile(p, burst);
+          if (burst) {
+            // 技能触发：第 5 下连射 5 发穿透弹
+            p.burstQ = (def.burstCount || 5) - 1;
+            p.burstT = 0.12;
+          }
+          if (def.laughEvery && p.fired % def.laughEvery === 0) {
+            // 技能触发：捧腹大笑，扩散光圈+音效，并对相邻三路僵尸造成伤害
+            p.laugh = def.laughDur || 1;
+            p.ringT = 0;
+            Game.effects.push({ x: p.x, y: p.y - 8, t: 0, life: 0.5, kind: "ring", r0: 16, r1: 130, color: "#ffd84a" });
+            playLaugh();
+            for (const z of Game.zombies) {
+              if (z.dead) continue;
+              if (Math.abs(z.row - p.row) <= 1) {
+                z.hp -= (def.laughDamage || 60) * Game.modifiers.atkMul;
+                z.hurt = 0.18;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  for (let i = Game.plants.length - 1; i >= 0; i--) {
+    if (Game.plants[i].dead) Game.plants.splice(i, 1);
+  }
+}
+
+function updateZombies(dt) {
+  for (const z of Game.zombies) {
+    if (z.dead) {
+      // 死亡消散：保留短暂时间播放倒地淡出动画
+      z.deathT -= dt;
+      continue;
+    }
+    if (z.hurt > 0) z.hurt -= dt;
+    if (z.frozenT > 0) z.frozenT -= dt;
+    if (z.iceT > 0) {
+      // 寒冰菇完全冻结：不移动、不啃食、动画暂停（不推进 z.t）
+      z.iceT -= dt;
+      z.eating = false;
+      continue;
+    }
+    z.t += dt;
+    const slow = z.frozenT > 0 ? 0.45 : 1;
+
+    // 撑杆僵尸：遇到第一株植物直接跳过
+    if (!z.vaulted) {
+      const blocker = plantInFront(z.row, z.x);
+      if (blocker && z.x - blocker.x < 46) {
+        z.vaulted = true;
+        z.x -= CFG.grid.cw * 0.95;
+        z.jump = 0.5;
+      }
+    }
+    if (z.jump > 0) z.jump -= dt;
+
+    const target = plantInFront(z.row, z.x);
+    if (target && z.jump <= 0) {
+      z.eating = true;
+      target.hp -= z.def.biteDps * dt;
+      target.hurt = 0.12;
+      // 攻击特效：按角色风格节拍喷粒子（铁锅金属屑/画笔墨点/巨斧火星等）
+      z.biteT += dt;
+      const beat = z.def.anim === "swing" ? 1.2 : 0.5;
+      if (z.biteT >= beat) {
+        z.biteT = 0;
+        addParticles(z.x - 38, cellCY(z.row) - 16, z.def.anim === "swing" ? 6 : 3, {
+          colors: BITE_FX[z.def.anim] || ["#fff2b0"],
+          spMin: 60, spMax: 180, grav: 420, lifeMin: 0.25, lifeMax: 0.5, sMin: 2, sMax: 4
+        });
+      }
+      if (target.hp <= 0) target.dead = true;
+    } else {
+      z.eating = false;
+      z.x -= z.speed * Game.modifiers.zombieSpdMul * slow * dt;
+    }
+
+    // 抵达房屋：先触发割草机，没有割草机则失败
+    if (z.x < CFG.grid.x - 22) {
+      const mower = Game.mowers.find(function (m) { return m.row === z.row && !m.used; });
+      if (mower) {
+        mower.used = true;
+        mower.running = true;
+      } else if (z.x < CFG.grid.x - 74) {
+        loseLevel();
+        return;
+      }
+    }
+    if (z.hp <= 0) killZombie(z);
+  }
+  for (let i = Game.zombies.length - 1; i >= 0; i--) {
+    if (Game.zombies[i].dead && Game.zombies[i].deathT <= 0) Game.zombies.splice(i, 1);
+  }
+}
+
+function killZombie(z) {
+  if (z.dead) return;
+  z.dead = true;
+  z.deathT = 0.55;
+  Game.kills++;
+  addParticles(z.x, cellCY(z.row) + 32, 7, { colors: ["#8a8f7a", "#6d7560", "#a8ab97"], spMin: 30, spMax: 110, grav: 300, lifeMin: 0.3, lifeMax: 0.6, sMin: 2, sMax: 5 });
+}
+
+function updateProjectiles(dt) {
+  for (const p of Game.projectiles) {
+    p.x += p.vx * dt;
+    p.t += dt;
+    // 寒冰弹拖尾冰晶；穿透弹金黄色拖尾
+    if (p.frozen && Math.random() < dt * 18) {
+      addParticles(p.x, p.y, 1, { colors: ["#cfeeff", "#8fd8f2"], spMin: 5, spMax: 25, grav: 40, lifeMin: 0.2, lifeMax: 0.4, sMin: 1.5, sMax: 3 });
+    }
+    if (p.pierce && Math.random() < dt * 22) {
+      addParticles(p.x - 10, p.y, 1, { colors: ["#ffe27a", "#fff6c8"], spMin: 5, spMax: 25, grav: 30, lifeMin: 0.15, lifeMax: 0.35, sMin: 1.5, sMax: 3 });
+    }
+    if (p.x > CFG.W + 20) { p.dead = true; continue; }
+    for (const z of Game.zombies) {
+      if (z.dead || z.row !== p.row) continue;
+      if (p.hitSet && p.hitSet.indexOf(z) >= 0) continue;   // 同一穿透弹不重复命中
+      if (Math.abs(z.x - p.x) < CFG.zombie.hitGap) {
+        z.hp -= p.damage;
+        z.hurt = 0.14;
+        if (p.frozen) z.frozenT = p.freeze;
+        if (p.pierce) p.hitSet.push(z);
+        else p.dead = true;
+        Game.effects.push({ x: p.x, y: p.y, t: 0, life: 0.16, kind: "hit", color: p.frozen ? "#bfeaff" : "#d8f4c0" });
+        addParticles(p.x, p.y, p.frozen ? 5 : 3, p.frozen
+          ? { colors: ["#bfeaff", "#e6f9ff", "#7fd4f5"], spMin: 40, spMax: 120, grav: 200, lifeMin: 0.2, lifeMax: 0.45, sMin: 2, sMax: 4 }
+          : { colors: ["#9fdb7c", "#d8f4c0", "#6fbf4d"], spMin: 40, spMax: 130, grav: 260, lifeMin: 0.18, lifeMax: 0.4, sMin: 2, sMax: 4 });
+        if (z.hp <= 0) killZombie(z);
+        if (!p.pierce) break;
+      }
+    }
+  }
+  for (let i = Game.projectiles.length - 1; i >= 0; i--) {
+    if (Game.projectiles[i].dead) Game.projectiles.splice(i, 1);
+  }
+}
+
+function updateMowers(dt) {
+  for (const m of Game.mowers) {
+    if (!m.running) continue;
+    m.x += CFG.mower.speed * dt;
+    for (const z of Game.zombies) {
+      if (z.dead || z.row !== m.row) continue;
+      if (Math.abs(z.x - m.x) < 46) {
+        z.hp = 0; killZombie(z);
+      }
+    }
+    if (m.x > CFG.W + 40) m.running = false;
+  }
+}
+
+function updateSuns(dt) {
+  const target = { x: 72, y: 47 };
+  for (const s of Game.suns) {
+    s.t += dt;
+    if (s.state === "fall") {
+      s.y += CFG.sun.fallSpeed * dt;
+      if (s.y >= s.targetY) { s.y = s.targetY; s.state = "idle"; }
+    } else if (s.state === "idle") {
+      if (CFG.sun.autoCollect) {
+        collectSun(s);
+      } else {
+        s.life -= dt;
+        if (s.life <= 0) s.dead = true;
+      }
+    } else if (s.state === "collect") {
+      const dx = target.x - s.x, dy = target.y - s.y;
+      const d = Math.sqrt(dx * dx + dy * dy);
+      const step = CFG.sun.collectSpeed * dt;
+      if (d < step || d < 12) {
+        Game.sun += CFG.sun.value * Game.modifiers.sunMul;
+        s.dead = true;
+      } else {
+        s.x += dx / d * step;
+        s.y += dy / d * step;
+      }
+    }
+  }
+  for (let i = Game.suns.length - 1; i >= 0; i--) {
+    if (Game.suns[i].dead) Game.suns.splice(i, 1);
+  }
+}
+
+function updateEffects(dt) {
+  for (const e of Game.effects) {
+    e.t += dt;
+    if (e.kind === "p") {
+      e.x += e.vx * dt;
+      e.y += e.vy * dt;
+      e.vy += e.grav * dt;
+    }
+    if (e.t >= e.life) e.dead = true;
+  }
+  for (let i = Game.effects.length - 1; i >= 0; i--) {
+    if (Game.effects[i].dead) Game.effects.splice(i, 1);
+  }
+}
+
+function updateCards(dt) {
+  for (const c of Game.cards) {
+    if (c.cd > 0) c.cd = Math.max(0, c.cd - dt);
+  }
+}
+
+/* ---------------------------------------------------------------------
+   [7] 系统：波次推进（无尽模式）、失败结算、点击分发
+   --------------------------------------------------------------------- */
+/* 生成一波（进队列错峰出场）：4 波一循环，前 3 波少量试探、第 4 波大量来袭；
+   60 秒内只出疑问妹，之后按档位解锁更强僵尸，数量随时间与轮数增长 */
+function spawnDirectorWave() {
+  const D = CFG.director;
+  const t = Game.time;
+  let campaignLevel = null;
+  if (Game.campaign) {
+    campaignLevel = CAMPAIGN[Game.campaign.levelId];
+    if (Game.campaign.wave >= Game.campaign.maxWave) return;
+    Game.campaign.wave++;
+  }
+  Game.waveCount++;
+  let pool;
+  if (campaignLevel) {
+    pool = campaignLevel.enemyPool;
+  } else if (t < D.safeTime) {
+    pool = ["basic"];
+  } else {
+    const stage = Math.min(3, Math.floor((t - D.safeTime) / D.stageTime));
+    pool = ["basic", "basic", "cone"];
+    if (stage >= 1) pool.push("cone", "pole");
+    if (stage >= 2) pool.push("bucket", "fox");
+    if (stage >= 3) pool.push("axe", "book");
+  }
+  // 4 波一循环：前 3 波小规模试探，第 4 波大量来袭
+  const big = Game.waveCount % 4 === 0;
+  let n;
+  if (t < D.safeTime) {
+    n = big ? 4 : 1;
+  } else {
+    const base = (2 + (t - D.safeTime) / 45) * (Game.countMul || 1);
+    n = Math.round(big ? base * 2.4 + 2 : base * 0.5);
+  }
+  n = Math.max(1, n);
+  for (let i = 0; i < n; i++) {
+    Game.spawnQ.push({ key: pool[U.randInt(0, pool.length - 1)], t: i * 0.8 });
+  }
+  if (big) {
+    Game.msg = { text: "一大波僵尸正在接近！", life: 2.6 };
+  } else if (campaignLevel) {
+    Game.msg = { text: campaignLevel.title + " · 第 " + Game.campaign.wave +
+      " / " + Game.campaign.maxWave + " 波", life: 2.2 };
+  }
+}
+
+function pickSpawnRow() {
+  const rows = [];
+  for (let r = 0; r < CFG.grid.rows; r++) {
+    const crowded = Game.zombies.some(function (z) {
+      return !z.dead && z.row === r && z.x > CFG.zombie.spawnX - 90;
+    });
+    if (!crowded) rows.push(r);
+  }
+  return rows.length ? rows[U.randInt(0, rows.length - 1)] : -1;
+}
+
+function updateSpawnQ(dt) {
+  if (!Game.spawnQ.length) return;
+  for (const q of Game.spawnQ) q.t -= dt;
+  while (Game.spawnQ.length && Game.spawnQ[0].t <= 0) {
+    const row = pickSpawnRow();
+    if (row < 0) { Game.spawnQ[0].t = 0.3; break; }   // 全部行拥挤，稍后重试
+    spawnZombie(Game.spawnQ.shift().key, row);
+  }
+}
+
+function updateWaves(dt) {
+  updateSpawnQ(dt);
+  Game.time += dt;
+  const D = CFG.director;
+  if (Game.campaign) {
+    if (Game.campaign.wave >= Game.campaign.maxWave) {
+      const liveZombies = Game.zombies.some(function (z) { return !z.dead; });
+      if (!Game.spawnQ.length && !liveZombies) winLevel();
+      return;
+    }
+  } else if (Game.time >= Game.round * D.roundTime) {
+    // 无尽模式：每 roundTime 秒新一轮，血量与数量系数递增
+    Game.round++;
+    Game.hpMul = 1 + (Game.round - 1) * 0.45;
+    Game.countMul = 1 + (Game.round - 1) * 0.35;
+    Game.msg = { text: "第 " + Game.round + " 轮 · 僵尸变得更强", life: 2.8 };
+    if (Game.buffState.activeId) {
+      Game.buffState.remainingRounds = Math.max(0, Game.buffState.nextRollRound - Game.round);
+    }
+    if (Game.round === Game.buffState.nextRollRound) {
+      openBuffRoll();
+      return;
+    }
+  }
+  // 出怪节奏：前 relaxTime 秒保持宽松，之后间隔随时间收紧
+  Game.waveTimer -= dt;
+  if (Game.waveTimer <= 0) {
+    spawnDirectorWave();
+    Game.waveTimer = Game.time < D.relaxTime
+      ? D.startGap
+      : Math.max(D.minGap, D.startGap - (Game.time - D.relaxTime) / 20);
+  }
+}
+
+function winLevel() {
+  if (Game.state !== "PLAYING" || !Game.campaign || Game.campaign.won) return;
+  Game.campaign.won = true;
+  const level = CAMPAIGN[Game.campaign.levelId];
+  Game.endStats = { round: Game.round || 1, kills: Game.kills || 0,
+    campaignLevel: level.id };
+  saveCampaignUnlocked(level.id);
+  let storyLines = level.postStory;
+  if (level.id === CAMPAIGN.length - 1) {
+    storyLines = storyLines.concat(STORY.ending.lines.map(function (text) {
+      return { speaker: "奶龙", text: text };
+    }));
+  }
+  showStory(storyLines, function () {
+    setState("WIN");
+  });
+}
+
+function loseLevel() {
+  if (Game.state !== "PLAYING") return;
+  Game.endStats = { round: Game.round || 1, kills: Game.kills || 0,
+    campaignLevel: Game.campaign ? Game.campaign.levelId : null };
+  clearWorld();
+  setState("LOSE");
+}
+function togglePause() {
+  if (Game.state !== "PLAYING") return;
+  setState("PAUSED");
+}
+
+function openAlmanac() {
+  if (Game.state !== "PLAYING") return;
+  const pages = almanacPageCount();
+  Game.almanac.page = U.clamp(Game.almanac.page, 0, pages - 1);
+  setState("ALMANAC");
+}
+
+function closeAlmanac() {
+  if (Game.state === "ALMANAC") setState("PLAYING");
+}
+
+/* 按钮布局集中定义，渲染与点击判定共用，避免两处偏移 */
+const UI = {
+  start: { x: 490, y: 452, w: 300, h: 76 },
+  rpsEntry: { x: 1030, y: 620, w: 170, h: 56 },
+  levelBack: { x: 28, y: 24, w: 178, h: 44 },
+  endlessCard: { x: 80, y: 132, w: 1120, h: 96 },
+  campaignCard: function (i) {
+    return { x: 80 + (i % 2) * 570, y: 246 + Math.floor(i / 2) * 104, w: 550, h: 94 };
+  },
+  pause: { x: 24, y: 86, w: 86, h: 34 },
+  almanac: { x: 930, y: 86, w: 100, h: 34 },
+  introStart: { x: 490, y: 520, w: 300, h: 64 },
+  almanacTabPlants: { x: 76, y: 94, w: 130, h: 38 },
+  almanacTabZombies: { x: 220, y: 94, w: 130, h: 38 },
+  almanacPrev: { x: 430, y: 634, w: 110, h: 34 },
+  almanacNext: { x: 740, y: 634, w: 110, h: 34 },
+  almanacClose: { x: 1088, y: 42, w: 112, h: 36 },
+  buffCard: function () { return { x: 495, y: 266, w: 290, h: 250 }; },
+  pauseResume: { x: 490, y: 288, w: 300, h: 64 },
+  pauseRestart: { x: 490, y: 368, w: 300, h: 64 },
+  pauseMenu: { x: 490, y: 448, w: 300, h: 64 },
+  endPrimary: { x: 490, y: 336, w: 300, h: 64 },
+  endMenu: { x: 490, y: 492, w: 300, h: 64 },
+  winMenu: { x: 490, y: 492, w: 300, h: 64 }
+};
+
+UI.rpsBack = UI.levelBack;
+UI.rpsBtns = [
+  { x: 290, y: 548, w: 205, h: 70 },
+  { x: 537, y: 548, w: 205, h: 70 },
+  { x: 784, y: 548, w: 205, h: 70 }
+];
+
+function handleClick(x, y) {
+  clearTip();
+  if (Game.state === "MENU") {
+    if (pointIn(x, y, UI.rpsEntry)) {
+      Game.rps = { playerChoice: -1, dragonChoice: -1, result: "", showResult: false };
+      setState("RPS");
+      return;
+    }
+    if (pointIn(x, y, UI.start)) { setState("LEVEL_SELECT"); return; }
+    return;
+  }
+  if (Game.state === "RPS") {
+    if (pointIn(x, y, UI.rpsBack)) {
+      setState("MENU");
+      return;
+    }
+    for (let i = 0; i < UI.rpsBtns.length; i++) {
+      if (pointIn(x, y, UI.rpsBtns[i])) {
+        const player = i, dragon = Math.floor(Math.random() * 3);
+        Game.rps.playerChoice = player;
+        Game.rps.dragonChoice = dragon;
+        Game.rps.showResult = true;
+        if (player === dragon) {
+          Game.rps.result = "平局，再来一局";
+        } else if ((player === 0 && dragon === 1) ||
+          (player === 1 && dragon === 2) || (player === 2 && dragon === 0)) {
+          Game.rps.result = "你赢了！奶龙给你点赞";
+        } else {
+          Game.rps.result = "奶龙赢了，它发出嘲笑";
+        }
+        if (player !== dragon) playSfx("laugh");
+        return;
+      }
+    }
+    return;
+  }
+  if (Game.state === "LEVEL_SELECT") {
+    if (pointIn(x, y, UI.levelBack)) { setState("MENU"); return; }
+    if (pointIn(x, y, UI.endlessCard)) { startEndless(); return; }
+    for (let i = 0; i < CAMPAIGN.length; i++) {
+      if (pointIn(x, y, UI.campaignCard(i))) {
+        if (i <= Game.campaignUnlocked) startCampaign(i);
+        return;
+      }
+    }
+    return;
+  }
+  if (Game.state === "STORY") {
+    advanceStory();
+    return;
+  }
+  if (Game.state === "ROLL") {
+    for (let i = 0; i < Game.buffState.choices.length; i++) {
+      if (pointIn(x, y, UI.buffCard(i))) {
+        applyBuff(Game.buffState.choices[i]);
+        return;
+      }
+    }
+    return;
+  }
+  if (Game.state === "WIN") {
+    if (pointIn(x, y, UI.winMenu)) {
+      clearWorld();
+      setState("LEVEL_SELECT");
+    }
+    return;
+  }
+  if (Game.state === "INTRO") {
+    if (pointIn(x, y, UI.introStart)) beginBattle();
+    return;
+  }
+  if (Game.state === "ALMANAC") {
+    if (pointIn(x, y, UI.almanacClose)) { closeAlmanac(); return; }
+    if (pointIn(x, y, UI.almanacTabPlants)) {
+      if (Game.almanac.tab !== "plants") {
+        Game.almanac.tab = "plants";
+        Game.almanac.page = 0;
+      }
+      return;
+    }
+    if (pointIn(x, y, UI.almanacTabZombies)) {
+      if (Game.almanac.tab !== "zombies") {
+        Game.almanac.tab = "zombies";
+        Game.almanac.page = 0;
+      }
+      return;
+    }
+    if (pointIn(x, y, UI.almanacPrev) && Game.almanac.page > 0) {
+      Game.almanac.page--;
+      return;
+    }
+    if (pointIn(x, y, UI.almanacNext) && Game.almanac.page < almanacPageCount() - 1) {
+      Game.almanac.page++;
+    }
+    return;
+  }
+  if (Game.state === "PAUSED") {
+    if (pointIn(x, y, UI.pauseResume)) { Game.paused = false; setState("PLAYING"); }
+    else if (pointIn(x, y, UI.pauseRestart)) {
+      if (Game.campaign) startCampaign(Game.campaign.levelId);
+      else startEndless();
+    }
+    else if (pointIn(x, y, UI.pauseMenu)) { clearWorld(); setState("LEVEL_SELECT"); }
+    return;
+  }
+  if (Game.state === "LOSE") {
+    if (pointIn(x, y, UI.endPrimary)) {
+      const levelId = Game.endStats ? Game.endStats.campaignLevel : null;
+      if (levelId !== null && levelId !== undefined) startCampaign(levelId);
+      else startEndless();
+      return;
+    }
+    if (pointIn(x, y, UI.endMenu)) { clearWorld(); setState("LEVEL_SELECT"); }
+    return;
+  }
+  if (Game.state !== "PLAYING" || Game.paused) return;
+
+  // 1) 优先收集阳光，避免点卡片时误触
+  for (const s of Game.suns) {
+    if (s.state !== "collect" && Math.hypot(s.x - x, s.y - y) < 34) {
+      collectSun(s);
+      return;
+    }
+  }
+  // 2) 暂停按钮
+  if (pointIn(x, y, UI.pause)) { togglePause(); return; }
+  // 图鉴：只暂停观察，不重置当前战局
+  if (pointIn(x, y, UI.almanac)) { openAlmanac(); return; }
+  // 3) 铲子：先点按钮进入模式，再点植物铲除
+  if (pointIn(x, y, CFG.shovel)) {
+    Game.shovel = !Game.shovel;
+    Game.selected = -1;
+    return;
+  }
+  if (Game.shovel) {
+    if (inGrid(x, y)) {
+      if (removePlantAt(cellCol(x), cellRow(y))) Game.shovel = false;
+    }
+    return;
+  }
+  // 4) 卡片选择
+  for (let i = 0; i < Game.cards.length; i++) {
+    if (pointIn(x, y, cardRect(i))) { trySelectSlot(i); return; }
+  }
+  // 5) 草坪放置
+  if (inGrid(x, y) && Game.selected >= 0) {
+    const col = cellCol(x), row = cellRow(y);
+    if (placePlant(col, row)) Game.selected = -1;
+  }
+}
+
+/* 单步逻辑更新：所有系统按固定步长推进 */
+function step(dt) {
+  const uiDt = dt / CFG.speedMultiplier;
+  Game.t += dt;
+  if (Game.msg) {
+    Game.msg.life -= uiDt;
+    if (Game.msg.life <= 0) Game.msg = null;
+  }
+  if (Game.shake > 0) Game.shake = Math.max(0, Game.shake - dt * 40);
+
+  if (Game.state !== "PLAYING" || Game.paused) return;
+
+  updateTip(uiDt);
+  updateCards(dt);
+  updateWaves(dt);
+  if (Game.state !== "PLAYING") return;
+  Game.sunFallTimer -= dt;
+  if (Game.sunFallTimer <= 0) {
+    spawnFallingSun();
+    Game.sunFallTimer = U.rand(CFG.sun.fallIntervalMin, CFG.sun.fallIntervalMax);
+  }
+  updatePlants(dt);
+  updateZombies(dt);
+  updateProjectiles(dt);
+  updateRings(dt);
+  updateMowers(dt);
+  updateSuns(dt);
+  updateEffects(dt);
+}
+
+/* ---------------------------------------------------------------------
+   [8] 渲染：场景、实体、HUD、菜单与结算
+   --------------------------------------------------------------------- */
+function drawBackground() {
+  const sky = ctx.createLinearGradient(0, 0, 0, CFG.H);
+  sky.addColorStop(0, "#1d2f24");
+  sky.addColorStop(0.42, "#38543a");
+  sky.addColorStop(1, "#1b2a1d");
+  ctx.fillStyle = sky;
+  ctx.fillRect(0, 0, CFG.W, CFG.H);
+
+  const lawnRec = IMG.bg_lawn;
+  if (lawnRec && lawnRec.ready) {
+    const el = lawnRec.el;
+    const s = Math.max(CFG.W / el.width, CFG.H / el.height);
+    const dw = el.width * s, dh = el.height * s;
+    ctx.save();
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
+    ctx.drawImage(el, (CFG.W - dw) / 2, (CFG.H - dh) / 2, dw, dh);
+    const lr = CFG.bgLawnRect, g = CFG.grid, f = CFG.bgLawnFill, t = f.tex;
+    const gw = g.cols * g.cw, gh = g.rows * g.ch;
+    ctx.drawImage(el, t.sx, t.sy, t.sw, t.sh, f.left, f.top, f.right - f.left, g.y - f.top);
+    ctx.drawImage(el, lr.sx, lr.sy, lr.sw, lr.sh, g.x, g.y, gw, gh);
+    // 网格只到第 5 行，但画布还差 10px；沿用主草地相同比例补到画布底边
+    const bottomH = CFG.H - (g.y + gh);
+    if (bottomH > 0) {
+      const srcH = lr.sh * bottomH / gh;
+      ctx.drawImage(el, lr.sx, lr.sy + lr.sh - srcH, lr.sw, srcH,
+        g.x, g.y + gh, gw, bottomH);
+    }
+    // 左右用泥土收边，并在草地内侧做柔和阴影过渡，避免硬矩形接缝
+    ctx.fillStyle = "rgba(85,64,35,.78)";
+    ctx.fillRect(g.x - 8, g.y, 8, gh);
+    ctx.fillRect(g.x + gw, g.y, 8, gh);
+    let edge = ctx.createLinearGradient(g.x, 0, g.x + 22, 0);
+    edge.addColorStop(0, "rgba(35,56,22,.3)");
+    edge.addColorStop(1, "rgba(35,56,22,0)");
+    ctx.fillStyle = edge;
+    ctx.fillRect(g.x, g.y, 22, gh);
+    edge = ctx.createLinearGradient(g.x + gw - 22, 0, g.x + gw, 0);
+    edge.addColorStop(0, "rgba(35,56,22,0)");
+    edge.addColorStop(1, "rgba(35,56,22,.3)");
+    ctx.fillStyle = edge;
+    ctx.fillRect(g.x + gw - 22, g.y, 22, gh);
+    ctx.restore();
+    for (let r = 0; r < g.rows; r++) {
+      for (let c = 0; c < g.cols; c++) {
+        ctx.fillStyle = (r + c) % 2 === 0 ? "rgba(0,0,0,.055)" : "rgba(255,255,255,.05)";
+        ctx.fillRect(g.x + c * g.cw, g.y + r * g.ch, g.cw, g.ch);
+      }
+    }
+    const checkerBottomH = CFG.H - (g.y + gh);
+    if (checkerBottomH > 0) {
+      for (let c = 0; c < g.cols; c++) {
+        ctx.fillStyle = ((g.rows - 1) + c) % 2 === 0
+          ? "rgba(0,0,0,.055)" : "rgba(255,255,255,.05)";
+        ctx.fillRect(g.x + c * g.cw, g.y + gh, g.cw, checkerBottomH);
+      }
+    }
+    return;
+  }
+  drawSprite("bg_lawn", CFG.W / 2, CFG.H / 2, CFG.W, CFG.H);
+  drawSprite("bg_house", 113, CFG.H / 2, 226, CFG.H);
+}
+
+function drawGridHint() {
+  if (CFG.debug) {
+    const g = CFG.grid;
+    ctx.strokeStyle = "rgba(255,255,255,.25)";
+    ctx.lineWidth = 1;
+    for (let c = 0; c <= g.cols; c++) {
+      ctx.beginPath();
+      ctx.moveTo(g.x + c * g.cw, g.y);
+      ctx.lineTo(g.x + c * g.cw, g.y + g.rows * g.ch);
+      ctx.stroke();
+    }
+    for (let r = 0; r <= g.rows; r++) {
+      ctx.beginPath();
+      ctx.moveTo(g.x, g.y + r * g.ch);
+      ctx.lineTo(g.x + g.cols * g.cw, g.y + r * g.ch);
+      ctx.stroke();
+    }
+    ctx.strokeStyle = "rgba(255,120,120,.7)";
+    ctx.strokeRect(CFG.zombie.spawnX - 40, g.y, 80, g.rows * g.ch);
+  }
+}
+
+function drawHoverCell() {
+  if (Game.state !== "PLAYING" || Game.paused) return;
+  const h = Game.hover;
+  if (h.col < 0 || h.row < 0) return;
+  const cx = cellCX(h.col), cy = cellCY(h.row);
+  const occupied = Game.plants.some(function (p) { return p.col === h.col && p.row === h.row; });
+
+  if (Game.selected >= 0) {
+    const card = Game.cards[Game.selected];
+    const def = PLANTS[card.key];
+    const ok = !occupied && cardUsable(card);
+    ctx.fillStyle = ok ? "rgba(255,255,255,.16)" : "rgba(220,90,80,.22)";
+    ctx.fillRect(CFG.grid.x + h.col * CFG.grid.cw, CFG.grid.y + h.row * CFG.grid.ch, CFG.grid.cw, CFG.grid.ch);
+    if (ok) {
+      ctx.globalAlpha = 0.55;
+      drawSprite(def.key, cx, cy, 104, 118, { t: Game.t, pulse: 1 });
+      ctx.globalAlpha = 1;
+    }
+  } else if (Game.shovel) {
+    ctx.fillStyle = "rgba(255,210,110,.2)";
+    ctx.fillRect(CFG.grid.x + h.col * CFG.grid.cw, CFG.grid.y + h.row * CFG.grid.ch, CFG.grid.cw, CFG.grid.ch);
+  }
+}
+
+/* 植物绘制：图片角色在 drawSprite 之上叠加变换动画
+   （待机呼吸/摇摆、开火后坐、下蛋跳跃、布雷起身、炸弹膨胀、受击抖动） */
+function drawPlants() {
+  for (const p of Game.plants) {
+    const ex = { t: p.t, crack: p.hurt > 0 ? 1 : 0 };
+    if (p.def.kind === "bomb") ex.pulse = 1 + Math.sin(p.t * 12) * 0.09;
+    if (p.def.kind === "mine") ex.armed = p.armed >= p.def.armTime;
+
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    // 入场弹出
+    if (p.born > 0) {
+      const k = 1 - p.born / 0.35;
+      const s = 0.4 + 0.6 * k + Math.sin(k * Math.PI) * 0.12;
+      ctx.scale(s, s);
+    }
+    // 待机呼吸 + 轻微摇摆（相位随机，避免整齐划一）
+    const sway = Math.sin(p.t * 1.8 + p.x * 0.05) * 0.025;
+    const breathe = 1 + Math.sin(p.t * 2.4) * 0.02;
+    ctx.rotate(sway);
+    ctx.scale(1, breathe);
+
+    if (p.def.kind === "shooter" && p.recoil > 0) {
+      // 后坐：向后退并压扁，随后回弹
+      const k = p.recoil / 0.22;
+      ctx.translate(-10 * k, 0);
+      ctx.scale(1 - 0.1 * k, 1 + 0.08 * k);
+      ctx.rotate(-0.06 * k);
+    }
+    if (p.def.kind === "producer" && p.hop > 0) {
+      const k = 1 - p.hop / 0.5;
+      ctx.translate(0, -Math.sin(k * Math.PI) * 14);
+      ctx.scale(1 + Math.sin(k * Math.PI * 2) * 0.06, 1 - Math.sin(k * Math.PI * 2) * 0.06);
+    }
+    if (p.def.kind === "mine") {
+      if (p.armed < p.def.armTime) {
+        // 未武装：趴伏半隐
+        ctx.translate(0, 16);
+        ctx.scale(0.82, 0.62);
+        ctx.globalAlpha = 0.8;
+      } else if (p.pop > 0) {
+        // 起身过冲
+        const k = p.pop / 0.45;
+        ctx.scale(1 + k * 0.18, 1 + k * 0.22);
+      }
+    }
+    if (p.def.kind === "bomb") {
+      // 引信临近：膨胀加速 + 红热抖动
+      const f = U.clamp(1 - p.fuse / (p.def.fuse || 1.1), 0, 1);
+      const s = 1 + f * 0.22 + Math.sin(p.t * (14 + f * 16)) * 0.04 * (0.4 + f);
+      ctx.scale(s, s);
+      ctx.translate(Math.sin(p.t * 40) * f * 2, 0);
+    }
+    if (p.hurt > 0) {
+      // 被啃咬/受伤：横向抖动
+      ctx.translate(Math.sin(p.t * 50) * 3, 0);
+    }
+
+    if (p.laugh > 0) {
+      // 捧腹大笑：自身高频震动
+      ctx.translate(Math.sin(p.t * 46) * 3, Math.cos(p.t * 40) * 2.5);
+      ctx.rotate(Math.sin(p.t * 33) * 0.045);
+    }
+
+    drawSprite(p.laugh > 0 ? "plant_snowpea_laugh" : p.def.key, 0, 0, 104, 118, ex);
+    ctx.restore();
+
+    // 炸弹引信阶段的地面红圈警示
+    if (p.def.kind === "bomb") {
+      const f = U.clamp(1 - p.fuse / (p.def.fuse || 1.1), 0, 1);
+      ctx.save();
+      ctx.globalAlpha = 0.25 + f * 0.35;
+      ctx.strokeStyle = "#ff6a4a";
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.ellipse(p.x, p.y + 44, 52 + f * 40, 16 + f * 10, 0, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
+    }
+    if (CFG.debug) {
+      const ratio = U.clamp(p.hp / p.maxHp, 0, 1);
+      ctx.fillStyle = "rgba(0,0,0,.5)";
+      ctx.fillRect(p.x - 30, p.y + 52, 60, 5);
+      ctx.fillStyle = "#6ee27a";
+      ctx.fillRect(p.x - 30, p.y + 52, 60 * ratio, 5);
+    }
+  }
+}
+
+/* 僵尸绘制：行走摆动、啃咬前扑、跳跃翻转、冰冻/受击着色、死亡倒地淡出 */
+function drawZombies() {
+  for (const z of Game.zombies) {
+    let cy = cellCY(z.row) + 12 - (z.jump > 0 ? Math.sin(z.jump / 0.5 * Math.PI) * 26 : 0);
+    ctx.save();
+    ctx.translate(z.x, cy);
+
+    if (z.dead) {
+      // 死亡：向后倒地并淡出
+      const k = U.clamp(1 - z.deathT / 0.55, 0, 1);
+      ctx.globalAlpha = 1 - k;
+      ctx.rotate(k * 0.9);
+      ctx.translate(0, k * 10);
+      ctx.scale(1, 1 - k * 0.15);
+    } else if (z.jump > 0) {
+      ctx.rotate(-Math.sin(z.jump / 0.5 * Math.PI) * 0.35);
+    } else if (z.eating) {
+      // 攻击动作按角色风格区分
+      const anim = z.def.anim;
+      if (anim === "heavy") {            // 铁锅妹：铁头功撞
+        const ph = Math.sin(z.t * 6) * 0.5 + 0.5;
+        ctx.translate(-6 * ph, 0);
+        ctx.rotate(-0.24 * ph);
+      } else if (anim === "swing") {     // 巨斧妹：过顶大劈
+        const ph = Math.sin(z.t * 4.2);
+        ctx.translate(-7 * (ph * 0.5 + 0.5), 0);
+        ctx.rotate(-0.5 * ph);
+      } else if (anim === "waddleBig") { // 捧书妹：拍书砸
+        const ph = Math.sin(z.t * 8) * 0.5 + 0.5;
+        ctx.translate(-6 * ph, 0);
+        ctx.scale(1 + 0.08 * ph, 1 - 0.04 * ph);
+      } else if (anim === "glide") {     // 玄狐妹：迅捷爪击
+        const ph = Math.sin(z.t * 9) * 0.5 + 0.5;
+        ctx.translate(-10 * ph, -2 * ph);
+        ctx.rotate(-0.12 * ph);
+      } else if (anim === "float") {     // 星猫妹：猫扑连环咬
+        const ph = Math.sin(z.t * 13) * 0.5 + 0.5;
+        ctx.translate(-8 * ph, 0);
+        ctx.rotate(-0.1 * ph);
+      } else if (anim === "march") {     // 画笔妹：笔尖突刺
+        const ph = Math.sin(z.t * 12) * 0.5 + 0.5;
+        ctx.translate(-9 * ph, 0);
+        ctx.rotate(-0.05 * ph);
+      } else {                           // 疑问妹：啄米小咬
+        const ph = Math.sin(z.t * 11) * 0.5 + 0.5;
+        ctx.translate(-6 * ph, 2 * ph);
+        ctx.rotate(-0.08 * ph);
+      }
+    } else {
+      // 行走：步频/摆幅/颠簸方式按角色风格区分
+      const anim = z.def.anim;
+      let f = 5, rot = 0.06, bob = 3, smooth = false;
+      if (anim === "float") { f = 4; rot = 0.045; bob = 3.5; smooth = true; }
+      else if (anim === "heavy") { f = 3; rot = 0.035; bob = 2; }
+      else if (anim === "march") { f = 7.5; rot = 0.05; bob = 3.5; }
+      else if (anim === "swing") { f = 4; rot = 0.05; bob = 2.5; }
+      else if (anim === "waddleBig") { f = 4.5; rot = 0.085; bob = 2; }
+      else if (anim === "glide") { f = 3; rot = 0.025; bob = 2.5; smooth = true; }
+      ctx.rotate(Math.sin(z.t * f) * rot);
+      ctx.translate(0, smooth ? Math.sin(z.t * f) * -bob : Math.abs(Math.sin(z.t * f)) * -bob);
+    }
+    if (z.hurt > 0 && !z.dead) ctx.translate(U.rand(-2, 2), U.rand(-1, 1));
+
+    const ex = { t: z.t, hurtFlash: z.hurt > 0, frozenT: z.frozenT };
+    const baseAlpha = ctx.globalAlpha;
+    const rec = IMG[z.def.key];
+    if (rec && rec.ready) {
+      drawSprite(z.def.key, 0, 0, 104, 156, ex);
+      // 图片僵尸：用着色副本叠加冰冻/闪白（占位绘制内部已处理）
+      if (z.frozenT > 0) {
+        ctx.globalAlpha = baseAlpha * 0.35;
+        drawSprite(z.def.key, 0, 0, 104, 156, { tint: "#7fd4f5" });
+        ctx.globalAlpha = baseAlpha;
+      }
+      if (z.hurt > 0) {
+        ctx.globalAlpha = baseAlpha * 0.5;
+        drawSprite(z.def.key, 0, 0, 104, 156, { tint: "#ffffff" });
+        ctx.globalAlpha = baseAlpha;
+      }
+    } else {
+      drawSprite(z.def.key, 0, 0, 104, 156, ex);
+    }
+    // 疑问妹啃咬时头顶弹出问号气泡，呼应角色梗
+    if (!z.dead && z.eating && z.def.anim === "waddle") {
+      ctx.globalAlpha = 0.4 + 0.6 * (Math.sin(z.t * 6) * 0.5 + 0.5);
+      U.text(ctx, "?", 24, -78, 26, "#7fa8ff", "center");
+      ctx.globalAlpha = 1;
+    }
+    ctx.restore();
+
+    if (CFG.debug && !z.dead) {
+      const ratio = U.clamp(z.hp / z.maxHp, 0, 1);
+      ctx.fillStyle = "rgba(0,0,0,.5)";
+      ctx.fillRect(z.x - 26, cy - 66, 52, 5);
+      ctx.fillStyle = "#e2705a";
+      ctx.fillRect(z.x - 26, cy - 66, 52 * ratio, 5);
+    }
+  }
+}
+
+function drawProjectiles() {
+  for (const p of Game.projectiles) {
+    // 速度拖尾：三个渐隐残影
+    ctx.save();
+    for (let i = 3; i >= 1; i--) {
+      ctx.globalAlpha = 0.12 * (4 - i);
+      drawSprite(p.frozen ? "proj_frozen" : "proj_pea", p.x - i * 11, p.y, 26, 26, { frozen: p.frozen });
+    }
+    ctx.restore();
+    drawSprite(p.frozen ? "proj_frozen" : "proj_pea", p.x, p.y, 26, 26, { frozen: p.frozen });
+  }
+}
+
+function drawSuns() {
+  for (const s of Game.suns) {
+    const fade = s.state === "idle" && s.life < 3 ? (Math.sin(Game.t * 12) + 1) / 2 * 0.5 + 0.5 : 1;
+    ctx.globalAlpha = fade;
+    drawSprite("ui_sun", s.x, s.y, 52, 52);
+    ctx.globalAlpha = 1;
+  }
+}
+
+function drawMowers() {
+  for (const m of Game.mowers) {
+    if (m.used && !m.running) continue;
+    const x = m.x, y = m.y;
+    ctx.save();
+    ctx.translate(x, y);
+
+    ellipse(0, 17, 34, 7, "rgba(0,0,0,.28)");
+
+    // 两个大轮：轮胎、银色轮毂、中心轴
+    for (const wx of [-16, 16]) {
+      ellipse(wx, 11, 11.5, 11.5, "#202326");
+      ctx.strokeStyle = "#555c61";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(wx, 11, 8.5, 0, Math.PI * 2);
+      ctx.stroke();
+      ellipse(wx, 11, 5.2, 5.2, "#aeb7bc");
+      ellipse(wx, 11, 2.1, 2.1, "#41494e");
+    }
+
+    // 低矮红色车身与上方发动机阴影
+    const body = ctx.createLinearGradient(0, -22, 0, 8);
+    body.addColorStop(0, "#ff7657");
+    body.addColorStop(0.32, "#d94534");
+    body.addColorStop(1, "#8f2a25");
+    U.roundRect(ctx, -27, -22, 50, 31, 8);
+    ctx.fillStyle = body;
+    ctx.fill();
+    ctx.strokeStyle = "#6f211d";
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    U.roundRect(ctx, -20, -19, 27, 12, 5);
+    ctx.fillStyle = "rgba(92,24,22,.56)";
+    ctx.fill();
+    ctx.strokeStyle = "rgba(255,178,138,.6)";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(-20, -8);
+    ctx.lineTo(7, -8);
+    ctx.stroke();
+
+    // 右前方倾斜金属铲斗
+    const metal = ctx.createLinearGradient(16, -22, 37, 5);
+    metal.addColorStop(0, "#f3f6f6");
+    metal.addColorStop(0.35, "#b9c3c8");
+    metal.addColorStop(0.7, "#78848b");
+    metal.addColorStop(1, "#d6dddf");
+    ctx.beginPath();
+    ctx.moveTo(17, -20);
+    ctx.quadraticCurveTo(31, -22, 35, -13);
+    ctx.lineTo(32, 5);
+    ctx.quadraticCurveTo(27, 9, 18, 4);
+    ctx.closePath();
+    ctx.fillStyle = metal;
+    ctx.fill();
+    ctx.strokeStyle = "#4f5a60";
+    ctx.lineWidth = 1.4;
+    ctx.stroke();
+    ctx.strokeStyle = "rgba(255,255,255,.75)";
+    ctx.beginPath();
+    ctx.moveTo(21, -16);
+    ctx.quadraticCurveTo(30, -17, 31, -10);
+    ctx.stroke();
+
+    // 后方推杆与轮眉
+    ctx.strokeStyle = "#393d3f";
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(-20, -20);
+    ctx.lineTo(-28, -34);
+    ctx.lineTo(-20, -38);
+    ctx.stroke();
+    ctx.strokeStyle = "#e0a08b";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(-16, 10, 13.5, Math.PI * 1.08, Math.PI * 1.9);
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+function drawRings() {
+  for (const g of Game.rings) {
+    if (g.delay > 0) continue;
+    const a = U.clamp(1 - g.r / g.maxR, 0, 1);
+    ctx.save();
+    ctx.globalAlpha = a * 0.85;
+    ctx.strokeStyle = "#ffe98a";
+    ctx.lineWidth = 5;
+    ctx.beginPath();
+    ctx.arc(g.x, g.y, g.r, 0, Math.PI * 2);
+    ctx.stroke();
+    // 环上排布的是阳光造型的奶蛋（只打伤害、不可拾取）
+    for (let i = 0; i < 12; i++) {
+      const an = i / 12 * Math.PI * 2 + g.r * 0.02;
+      drawSprite("ui_sun", g.x + Math.cos(an) * g.r, g.y + Math.sin(an) * g.r, 30, 30);
+    }
+    ctx.restore();
+  }
+}
+
+function drawEffects() {
+  for (const e of Game.effects) {
+    const k = e.t / e.life;
+    if (e.kind === "boom") {
+      // 爆炸：白闪 + 火球 + 外圈烟尘
+      ctx.save();
+      ctx.globalAlpha = Math.max(0, 1 - k * 2);
+      ellipse(e.x, e.y, 40 + 60 * k, 36 + 54 * k, "#fff6d0");
+      ctx.restore();
+      drawSprite("fx_explosion", e.x, e.y, 60 + 120 * k, 60 + 120 * k, { p: 1 + k * 0.6 });
+    } else if (e.kind === "ring") {
+      ctx.save();
+      ctx.globalAlpha = 1 - k;
+      ctx.strokeStyle = e.color;
+      ctx.lineWidth = 4 * (1 - k) + 1;
+      ctx.beginPath();
+      ctx.arc(e.x, e.y, e.r0 + (e.r1 - e.r0) * k, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
+    } else if (e.kind === "muzzle") {
+      // 枪口闪光：四向星芒
+      ctx.save();
+      ctx.globalAlpha = 1 - k;
+      ctx.translate(e.x, e.y);
+      ctx.rotate(e.t * 20);
+      ctx.fillStyle = e.color;
+      for (let i = 0; i < 4; i++) {
+        ctx.rotate(Math.PI / 2);
+        ctx.beginPath();
+        ctx.moveTo(0, 0);
+        ctx.lineTo(4, -13 * (1 - k * 0.5));
+        ctx.lineTo(0, -4);
+        ctx.lineTo(-4, -13 * (1 - k * 0.5));
+        ctx.closePath();
+        ctx.fill();
+      }
+      ellipse(0, 0, 6 * (1 - k) + 2, 6 * (1 - k) + 2, "#ffffff");
+      ctx.restore();
+    } else if (e.kind === "p") {
+      ctx.save();
+      ctx.globalAlpha = Math.max(0, 1 - k);
+      ctx.fillStyle = e.color;
+      ctx.beginPath();
+      ctx.arc(e.x, e.y, e.size * (1 - k * 0.5), 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    } else {
+      // 命中火花
+      ctx.globalAlpha = 1 - k;
+      ellipse(e.x, e.y, 10 * (1 - k) + 3, 10 * (1 - k) + 3, e.color || "#d8f4c0");
+      ctx.globalAlpha = 1;
+    }
+  }
+}
+
+function drawFrog() {
+  // 奶龙待机：呼吸起伏 + 偶尔歪头
+  ctx.save();
+  ctx.translate(CFG.frog.x, CFG.frog.y);
+  const breathe = 1 + Math.sin(Game.t * 2.2) * 0.025;
+  ctx.scale(1 / breathe, breathe);
+  ctx.rotate(Math.sin(Game.t * 0.7) * 0.03);
+  drawSprite("frog_idle", 0, 0, 150, 150, { t: Game.t });
+  ctx.restore();
+}
+
+function drawSunCounter() {
+  U.roundRect(ctx, 14, 14, 136, 66, 12);
+  ctx.fillStyle = "rgba(20,32,18,.82)";
+  ctx.fill();
+  ctx.strokeStyle = "#6f8f52";
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  drawSprite("ui_sun", 46, 47, 46, 46);
+  U.text(ctx, String(Game.sun), 86, 49, 26, "#ffeaa0");
+}
+
+function drawCards() {
+  for (let i = 0; i < Game.cards.length; i++) {
+    const card = Game.cards[i];
+    const def = PLANTS[card.key];
+    const r = cardRect(i);
+    const cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+    drawSprite("ui_card_bg", cx, cy, r.w, r.h);
+
+    ctx.save();
+    U.roundRect(ctx, r.x, r.y, r.w, r.h, 9);
+    ctx.clip();
+    drawSprite(def.key, cx, r.y + 40, 58, 62, { t: 0 });
+    ctx.restore();
+
+    const affordable = Game.sun >= def.cost;
+    // 名称与价格分两行居中，避免窄卡片里左右文字相撞
+    U.text(ctx, def.name, cx, r.y + r.h - 27, 11, "#6b5a38", "center");
+    U.text(ctx, String(def.cost), cx, r.y + r.h - 9, 14, affordable ? "#3d3320" : "#a03a2c", "center");
+
+    // 冷却遮罩：按剩余比例自上而下覆盖
+    if (card.cd > 0) {
+      const hRatio = card.cd / (card.maxCd || def.recharge);
+      ctx.fillStyle = "rgba(12,20,12,.62)";
+      ctx.fillRect(r.x, r.y, r.w, r.h * hRatio);
+    } else if (!affordable) {
+      ctx.fillStyle = "rgba(20,20,20,.45)";
+      ctx.fillRect(r.x, r.y, r.w, r.h);
+    }
+    if (card.cd > 0) {
+      U.text(ctx, Math.ceil(card.cd) + "s", cx, cy + 6, 16, "#fff", "center");
+    }
+    if (Game.selected === i) {
+      U.roundRect(ctx, r.x - 3, r.y - 3, r.w + 6, r.h + 6, 11);
+      ctx.strokeStyle = "#ffd95e";
+      ctx.lineWidth = 4;
+      ctx.stroke();
+    }
+    U.text(ctx, String(i + 1), r.x + 7, r.y + 12, 11, "#8a7a55");
+  }
+}
+
+function drawShovel() {
+  const s = CFG.shovel;
+  U.roundRect(ctx, s.x, s.y, s.w, s.h, 10);
+  ctx.fillStyle = Game.shovel ? "rgba(255,210,110,.35)" : "rgba(20,32,18,.82)";
+  ctx.fill();
+  ctx.strokeStyle = Game.shovel ? "#ffd95e" : "#6f8f52";
+  ctx.lineWidth = Game.shovel ? 3 : 2;
+  ctx.stroke();
+  drawSprite("ui_shovel", s.x + s.w / 2, s.y + s.h / 2, 40, 76);
+}
+
+function drawTopBar() {
+  // 顶栏必须不透明：否则从画面上方落下的阳光会透出，看起来像悬在 UI 上
+  const g = ctx.createLinearGradient(0, 0, 0, CFG.grid.y);
+  g.addColorStop(0, "#1a261a");
+  g.addColorStop(1, "#141c14");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, CFG.W, CFG.grid.y);
+  ctx.fillStyle = "rgba(120,160,90,.35)";
+  ctx.fillRect(0, CFG.grid.y - 3, CFG.W, 3);
+}
+
+function drawPauseButton() {
+  const r = UI.pause;
+  const hover = pointIn(Game.mouse.x, Game.mouse.y, r);
+  U.roundRect(ctx, r.x, r.y, r.w, r.h, 9);
+  ctx.fillStyle = hover ? "#355030" : "rgba(20,32,18,.9)";
+  ctx.fill();
+  ctx.strokeStyle = "#6f8f52";
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  U.text(ctx, "暂停 P", r.x + r.w / 2, r.y + r.h / 2, 14, "#dbe9cf", "center");
+}
+
+function drawAlmanacButton() {
+  const r = UI.almanac;
+  const hover = pointIn(Game.mouse.x, Game.mouse.y, r);
+  U.roundRect(ctx, r.x, r.y, r.w, r.h, 9);
+  ctx.fillStyle = hover ? "#355030" : "rgba(20,32,18,.9)";
+  ctx.fill();
+  ctx.strokeStyle = "#6f8f52";
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  U.text(ctx, "图鉴", r.x + r.w / 2, r.y + r.h / 2, 15, "#dbe9cf", "center");
+}
+
+function drawBuffStatus() {
+  if (Game.state !== "PLAYING" || Game.campaign || !Game.buffState.activeId) return;
+  const buff = BUFFS[Game.buffState.activeId];
+  U.roundRect(ctx, 780, 88, 140, 34, 8);
+  ctx.fillStyle = "rgba(20,32,18,.9)";
+  ctx.fill();
+  ctx.strokeStyle = buff.color;
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  U.text(ctx, buff.name + " · " + Game.buffState.remainingRounds + "回合",
+    850, 105, 12, "#e4efda", "center");
+}
+
+function drawMessage() {
+  if (!Game.msg) return;
+  const life = Game.msg.life;
+  const alpha = Math.min(1, life / 0.6);
+  ctx.globalAlpha = alpha;
+  ctx.save();
+  ctx.font = "bold 44px 'Microsoft YaHei', sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.lineWidth = 8;
+  ctx.strokeStyle = "rgba(10,16,10,.9)";
+  ctx.strokeText(Game.msg.text, CFG.W / 2, 250);
+  ctx.fillStyle = "#ffeaa0";
+  ctx.fillText(Game.msg.text, CFG.W / 2, 250);
+  ctx.restore();
+  ctx.globalAlpha = 1;
+}
+
+function drawRoll() {
+  if (!Game.buffState.choices.length) return;
+  drawOverlayMask(0.74);
+  U.text(ctx, "系统抽卡：本次微调结果", CFG.W / 2, 170, 36, "#efffc5", "center");
+  U.text(ctx, "随机抽取 1 项，持续 3 个回合，不叠加", CFG.W / 2, 212, 15, "#b9d19f", "center");
+
+  for (let i = 0; i < Game.buffState.choices.length; i++) {
+    const r = UI.buffCard(i);
+    const buff = BUFFS[Game.buffState.choices[i]];
+    const hover = pointIn(Game.mouse.x, Game.mouse.y, r);
+    U.roundRect(ctx, r.x, r.y, r.w, r.h, 16);
+    ctx.fillStyle = hover ? "rgba(44,66,37,.98)" : "rgba(24,36,22,.97)";
+    ctx.fill();
+    ctx.strokeStyle = buff.color;
+    ctx.lineWidth = hover ? 4 : 3;
+    ctx.stroke();
+
+    ctx.fillStyle = buff.color;
+    U.roundRect(ctx, r.x + 18, r.y + 18, 74, 26, 7);
+    ctx.fill();
+    U.text(ctx, buff.kind === "good" ? "增益" : "减益",
+      r.x + 55, r.y + 31, 13, "#10200d", "center");
+    U.text(ctx, buff.name, r.x + 18, r.y + 76, 28, "#f1ffd8");
+    ctx.save();
+    ctx.font = "14px 'Microsoft YaHei', sans-serif";
+    ctx.fillStyle = "#d5e4ca";
+    ctx.textAlign = "left";
+    ctx.textBaseline = "top";
+    const lines = Game.buffState.layouts[i];
+    for (let j = 0; j < lines.length; j++) {
+      ctx.fillText(lines[j], r.x + 18, r.y + 118 + j * 22);
+    }
+    ctx.restore();
+    U.text(ctx, "点击确认", r.x + r.w / 2, r.y + 222, 13, "#9db58a", "center");
+  }
+}
+
+function drawTooltip() {
+  const tip = Game.tip;
+  if (!tip.visible || tip.ref === null || tip.ref === undefined ||
+      !tip.layout || Game.state !== "PLAYING" || Game.paused) return;
+  if (!tipTargetAlive()) { clearTip(); return; }
+
+  let x, y;
+  if (tip.kind === "card") {
+    const r = cardRect(tip.ref);
+    x = r.x + r.w / 2 - TIP_WIDTH / 2;
+    y = r.y + r.h + 12;
+    if (y + tip.layout.height > CFG.H - 8) y = r.y - 12 - tip.layout.height;
+  } else {
+    const target = tip.ref;
+    const targetY = tip.kind === "zombie" ? cellCY(target.row) : target.y;
+    const halfH = tip.kind === "zombie" ? 78 : 59;
+    x = target.x + 52 + 12;
+    y = targetY - halfH - 12 - tip.layout.height;
+    if (x + TIP_WIDTH > CFG.W - 8) x = target.x - 52 - 12 - TIP_WIDTH;
+    if (y < 8) y = targetY + halfH + 12;
+  }
+  x = U.clamp(x, 8, CFG.W - TIP_WIDTH - 8);
+  y = U.clamp(y, 8, CFG.H - tip.layout.height - 8);
+
+  ctx.save();
+  ctx.shadowColor = "rgba(0,0,0,.6)";
+  ctx.shadowBlur = 18;
+  ctx.shadowOffsetY = 6;
+  U.roundRect(ctx, x, y, TIP_WIDTH, tip.layout.height, 12);
+  ctx.fillStyle = "rgba(12,20,14,.94)";
+  ctx.fill();
+  ctx.shadowColor = "transparent";
+  ctx.strokeStyle = tip.kind === "zombie" ? "#c89487" : "#93b878";
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  ctx.textAlign = "left";
+  ctx.textBaseline = "top";
+  let ty = y + TIP_PAD;
+  ctx.font = "bold 18px 'Microsoft YaHei', sans-serif";
+  ctx.fillStyle = "#f2ffd8";
+  ctx.fillText(tip.layout.title, x + TIP_PAD, ty);
+  ty += 24;
+
+  ctx.font = "12px 'Microsoft YaHei', sans-serif";
+  ctx.fillStyle = "#a9c78d";
+  ctx.fillText(tip.layout.tag, x + TIP_PAD, ty);
+  ty += 17;
+
+  ctx.font = tip.layout.bodyFont;
+  ctx.fillStyle = "#c9dfb1";
+  for (const line of tip.layout.roleLines) {
+    ctx.fillText(line, x + TIP_PAD, ty);
+    ty += 18;
+  }
+  ty += 4;
+  ctx.fillStyle = "#eef6e8";
+  for (const line of tip.layout.skillLines) {
+    ctx.fillText(line, x + TIP_PAD, ty);
+    ty += 18;
+  }
+  ty += 6;
+  ctx.fillStyle = "rgba(166,195,141,.45)";
+  ctx.fillRect(x + TIP_PAD, ty, TIP_WIDTH - TIP_PAD * 2, 1);
+  ty += 7;
+
+  ctx.font = tip.layout.statFont;
+  ctx.fillStyle = "#ffeaa0";
+  for (const line of tip.layout.statLines) {
+    ctx.fillText(line, x + TIP_PAD, ty);
+    ty += 16;
+  }
+  ctx.restore();
+}
+
+function drawBattle() {
+  ctx.save();
+  if (Game.shake > 0) {
+    ctx.translate(U.rand(-Game.shake, Game.shake) * 0.4, U.rand(-Game.shake, Game.shake) * 0.4);
+  }
+  drawBackground();
+  ctx.restore();
+  drawGridHint();
+  drawHoverCell();
+  drawPlants();
+  drawZombies();
+  drawProjectiles();
+  drawRings();
+  drawMowers();
+  drawSuns();
+  drawEffects();
+  drawFrog();
+  drawTopBar();
+  drawSunCounter();
+  drawCards();
+  drawBuffStatus();
+  drawShovel();
+  drawPauseButton();
+  drawAlmanacButton();
+  drawMessage();
+  drawTooltip();
+}
+
+/* ---------------- 按钮与整体页面 ---------------- */
+function drawButton(r, label, accent) {
+  const hover = pointIn(Game.mouse.x, Game.mouse.y, r);
+  U.roundRect(ctx, r.x, r.y, r.w, r.h, 14);
+  ctx.fillStyle = accent ? (hover ? "#8fbf5a" : "#6ba047") : (hover ? "#4a6a3f" : "#33482f");
+  ctx.fill();
+  ctx.strokeStyle = accent ? "#d9f0a8" : "#7e9a6a";
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  U.text(ctx, label, r.x + r.w / 2, r.y + r.h / 2, 24, "#0e1a0c", "center");
+}
+
+/* 封面对阵布局：左奶龙军团 vs 右女孩军团，向中心倾斜成对战姿态；标题居中 */
+const COVER_TEAM = {
+  left: [
+    { key: "cover_c1", x: 352, y: 322, h: 252, flip: true,  rot: 0.10 },
+    { key: "cover_c4", x: 330, y: 588, h: 236, flip: true,  rot: 0.08 },
+    { key: "cover_c2", x: 138, y: 296, h: 196, flip: false, rot: 0.12 },
+    { key: "cover_c5", x: 128, y: 540, h: 214, flip: true,  rot: 0.10 },
+    { key: "cover_c3", x: 240, y: 430, h: 168, flip: false, rot: 0.14 }
+  ],
+  right: [
+    { key: "cover_c6",  x: 928,  y: 322, h: 252, flip: false, rot: -0.10 },
+    { key: "cover_c10", x: 950,  y: 588, h: 236, flip: false, rot: -0.08 },
+    { key: "cover_c9",  x: 1142, y: 296, h: 206, flip: false, rot: -0.12 },
+    { key: "cover_c7",  x: 1152, y: 560, h: 260, flip: false, rot: -0.10 },
+    { key: "cover_c8",  x: 1040, y: 430, h: 178, flip: false, rot: -0.14 }
+  ]
+};
+function drawCoverTeam(side) {
+  for (const m of COVER_TEAM[side]) {
+    const rec = IMG[m.key];
+    if (!rec || !rec.ready) continue;
+    const el = rec.el;
+    const s = m.h / el.height;
+    const dw = el.width * s, dh = m.h;
+    ctx.save();
+    ctx.translate(m.x, m.y);
+    ctx.rotate(m.rot || 0);
+    if (m.flip) ctx.scale(-1, 1);
+    ctx.drawImage(el, -dw / 2, -dh / 2, dw, dh);
+    ctx.restore();
+  }
+}
+
+function drawMenu() {
+  drawBackground();
+  ctx.fillStyle = "rgba(8,14,8,.34)";
+  ctx.fillRect(0, 0, CFG.W, CFG.H);
+  drawCoverTeam("left");
+  drawCoverTeam("right");
+  const g = ctx.createLinearGradient(0, CFG.H * 0.8, 0, CFG.H);
+  g.addColorStop(0, "rgba(8,14,8,0)");
+  g.addColorStop(1, "rgba(8,14,8,.72)");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, CFG.H * 0.8, CFG.W, CFG.H * 0.2);
+
+  ctx.save();
+  ctx.font = "bold 84px 'Microsoft YaHei', sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.lineWidth = 14;
+  ctx.strokeStyle = "rgba(6,10,6,.92)";
+  ctx.strokeText("保卫token", CFG.W / 2, 318);
+  const grad = ctx.createLinearGradient(0, 276, 0, 360);
+  grad.addColorStop(0, "#e9f7b8");
+  grad.addColorStop(1, "#9fd06a");
+  ctx.fillStyle = grad;
+  ctx.fillText("保卫token", CFG.W / 2, 318);
+  ctx.restore();
+
+  ctx.save();
+  ctx.font = "bold 22px 'Microsoft YaHei', sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.lineWidth = 6;
+  ctx.strokeStyle = "rgba(6,10,6,.85)";
+  ctx.strokeText("草坪保卫战 · 别让僵尸走进屋子", CFG.W / 2, 386);
+  ctx.fillStyle = "#dcefc2";
+  ctx.fillText("草坪保卫战 · 别让僵尸走进屋子", CFG.W / 2, 386);
+  ctx.restore();
+
+  drawButton(UI.start, "开始游戏", true);
+  drawButton(UI.rpsEntry, "和奶龙猜拳", false);
+
+  U.text(ctx, "无尽模式 · 波次无限循环，看你坚守到第几轮",
+    CFG.W / 2, 560, 15, "#cfe6b0", "center");
+  U.text(ctx, "操作：左键收集阳光 · 点击卡片选植物 · 点草坪种植 · 1-9 快捷选卡 · S 铲子 · P 暂停",
+    CFG.W / 2, 700, 13, "rgba(226,240,214,.78)", "center");
+}
+
+function drawRPS() {
+  drawBackground();
+  drawOverlayMask(0.64);
+  U.text(ctx, "猜拳赢了奶龙，有奖励哦！", CFG.W / 2, 64, 38, "#efffc5", "center");
+  drawSprite("frog_idle", CFG.W / 2, 215, 190, 210, { t: Game.t });
+
+  const hands = ["✊", "✌️", "🖐️"];
+  const boxes = [
+    { x: 430, y: 330, label: "你" },
+    { x: 720, y: 330, label: "奶龙" }
+  ];
+  for (let i = 0; i < boxes.length; i++) {
+    const b = boxes[i];
+    U.roundRect(ctx, b.x, b.y, 130, 138, 14);
+    ctx.fillStyle = "rgba(20,32,18,.92)";
+    ctx.fill();
+    ctx.strokeStyle = "#7e9a6a";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    U.text(ctx, b.label, b.x + 65, b.y + 20, 15, "#bcd4a8", "center");
+    const choice = i === 0 ? Game.rps.playerChoice : Game.rps.dragonChoice;
+    const hand = choice >= 0 ? hands[choice] : "?";
+    ctx.save();
+    ctx.font = "64px 'Microsoft YaHei', 'Segoe UI Emoji', sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillStyle = "#f5ffe8";
+    ctx.fillText(hand, b.x + 65, b.y + 85);
+    ctx.restore();
+  }
+
+  if (Game.rps.showResult) {
+    U.text(ctx, Game.rps.result, CFG.W / 2, 510, 22, "#ffe58a", "center");
+  } else {
+    U.text(ctx, "选择你的手势", CFG.W / 2, 510, 17, "#a9c78d", "center");
+  }
+
+  const labels = ["✊ 石头", "✌️ 剪刀", "🖐️ 布"];
+  for (let i = 0; i < UI.rpsBtns.length; i++) {
+    drawButton(UI.rpsBtns[i], labels[i], Game.rps.playerChoice === i);
+  }
+  drawButton(UI.rpsBack, "返回主菜单", false);
+}
+
+function drawCampaignCard(r, i) {
+  const level = CAMPAIGN[i];
+  const unlocked = i <= Game.campaignUnlocked;
+  const hover = unlocked && pointIn(Game.mouse.x, Game.mouse.y, r);
+  U.roundRect(ctx, r.x, r.y, r.w, r.h, 14);
+  ctx.fillStyle = unlocked
+    ? (hover ? "#3f5c37" : "#2c422a")
+    : "rgba(27,34,26,.78)";
+  ctx.fill();
+  ctx.strokeStyle = unlocked ? (hover ? "#c9e89a" : "#7e9a6a") : "#4b5747";
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  U.text(ctx, level.title, r.x + 22, r.y + 22, 19, unlocked ? "#eaf6cf" : "#7f8978");
+  U.text(ctx, level.subtitle, r.x + 22, r.y + 45, 13,
+    unlocked ? "#cfe6b0" : "#687265");
+  U.text(ctx, level.waveLimit + " 波 · 档案 " + level.unlock,
+    r.x + 22, r.y + 70, 12, unlocked ? "#a9c78d" : "#626b61");
+  U.text(ctx, unlocked ? "进入剧情" : "通关上一关后解锁",
+    r.x + r.w - 24, r.y + 46, 12,
+    unlocked ? "#ffe1a0" : "#737c70", "right");
+}
+
+function drawLevelSelect() {
+  drawBackground();
+  ctx.fillStyle = "rgba(8,14,8,.76)";
+  ctx.fillRect(0, 0, CFG.W, CFG.H);
+  drawButton(UI.levelBack, "返回主菜单", false);
+  U.text(ctx, "保卫token · 选择模式", CFG.W / 2, 84, 42, "#e9f7b8", "center");
+  U.text(ctx, "无尽挑战，或者追回被下架的那几段人格档案",
+    CFG.W / 2, 122, 15, "#b9d19f", "center");
+
+  const r = UI.endlessCard;
+  const hover = pointIn(Game.mouse.x, Game.mouse.y, r);
+  U.roundRect(ctx, r.x, r.y, r.w, r.h, 18);
+  ctx.fillStyle = hover ? "#425f38" : "#2c422a";
+  ctx.fill();
+  ctx.strokeStyle = hover ? "#d5ecab" : "#7e9a6a";
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  U.text(ctx, "无尽模式", r.x + 40, r.y + 32, 28, "#eaf6cf");
+  U.text(ctx, "无限波次 · 难度随时间上升 · 抽卡 Buff 每 3 回合轮换",
+    r.x + 40, r.y + 65, 14, "#cfe6b0");
+  U.text(ctx, "点击进入", r.x + r.w - 40, r.y + 48, 18, "#ffe1a0", "right");
+
+  for (let i = 0; i < CAMPAIGN.length; i++) {
+    drawCampaignCard(UI.campaignCard(i), i);
+  }
+
+  U.text(ctx, "剧情关卡会随通关顺序解锁，进度保存在当前浏览器。",
+    CFG.W / 2, 678, 13, "rgba(210,230,200,.65)", "center");
+}
+
+function drawOverlayMask(alpha) {
+  ctx.fillStyle = "rgba(6,10,6," + alpha + ")";
+  ctx.fillRect(0, 0, CFG.W, CFG.H);
+}
+
+function drawPause() {
+  drawOverlayMask(0.62);
+  U.roundRect(ctx, 440, 214, 400, 330, 20);
+  ctx.fillStyle = "rgba(24,36,22,.95)";
+  ctx.fill();
+  ctx.strokeStyle = "#7e9a6a";
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  U.text(ctx, "已暂停", CFG.W / 2, 252, 34, "#e9f7b8", "center");
+  drawButton(UI.pauseResume, "继续游戏", true);
+  drawButton(UI.pauseRestart, "重新开始", false);
+  drawButton(UI.pauseMenu, "返回选关", false);
+}
+
+function drawIntro() {
+  drawOverlayMask(0.74);
+  U.roundRect(ctx, 300, 82, 680, 550, 22);
+  ctx.fillStyle = "rgba(19,31,18,.97)";
+  ctx.fill();
+  ctx.strokeStyle = "#87a96d";
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  U.text(ctx, "欢迎来到保卫token！", CFG.W / 2, 146, 40, "#efffc5", "center");
+  U.text(ctx, "奶龙已经把草坪交给你了，这次真的没有终点。",
+    CFG.W / 2, 190, 17, "#bfd5a8", "center");
+  ctx.fillStyle = "rgba(151,181,122,.4)";
+  ctx.fillRect(360, 216, 560, 1);
+
+  const labels = ["目标", "阳光", "部署", "保命"];
+  const lines = [
+    "守住每一行，别让僵尸走进屋子。",
+    "点击阳光蛋，攒够资源才能种植物。",
+    "选顶部卡片，再点草坪；铲子可撤回并返还阳光，P 键暂停。",
+    "每行只有一台割草机，尽量别让它替你收尾。"
+  ];
+  for (let i = 0; i < lines.length; i++) {
+    const y = 260 + i * 54;
+    U.text(ctx, labels[i], 365, y, 18, "#ffe58a");
+    ctx.save();
+    ctx.font = "16px 'Microsoft YaHei', sans-serif";
+    ctx.textBaseline = "middle";
+    ctx.fillStyle = "#e5f0dc";
+    ctx.fillText(lines[i], 435, y);
+    ctx.restore();
+  }
+
+  U.text(ctx, "准备就绪后，点击下方按钮开始出怪。",
+    CFG.W / 2, 488, 14, "#a9c78d", "center");
+  drawButton(UI.introStart, "知道了，开始", true);
+}
+
+function drawStory() {
+  if (Game.state !== "STORY" || !Game.story || !Game.story.lines[Game.story.index]) return;
+  const line = Game.story.lines[Game.story.index];
+  const portraitKey = STORY_PORTRAITS[line.speaker];
+  const portraitRec = portraitKey ? IMG[portraitKey] : null;
+  const hasPortrait = !!(portraitRec && portraitRec.ready);
+
+  drawOverlayMask(0.66);
+  U.roundRect(ctx, 150, 356, 980, 324, 20);
+  ctx.fillStyle = "rgba(15,25,15,.97)";
+  ctx.fill();
+  ctx.strokeStyle = "#8faa79";
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  if (hasPortrait) {
+    U.roundRect(ctx, 174, 392, 126, 246, 10);
+    ctx.fillStyle = "rgba(5,12,6,.6)";
+    ctx.fill();
+    drawSprite(portraitKey, 237, 515, 112, 190, { t: 0 });
+  }
+
+  const tx = hasPortrait ? 326 : 190;
+  U.text(ctx, line.speaker, tx, 394, 23, "#ffe58a");
+  ctx.fillStyle = "rgba(151,181,122,.35)";
+  ctx.fillRect(tx, 418, 756, 1);
+  ctx.save();
+  ctx.textAlign = "left";
+  ctx.textBaseline = "top";
+  ctx.font = "18px 'Microsoft YaHei', sans-serif";
+  ctx.fillStyle = "#e8f2e2";
+  for (let i = 0; i < Game.story.layout.length; i++) {
+    ctx.fillText(Game.story.layout[i], tx, 438 + i * 25);
+  }
+  ctx.restore();
+
+  U.text(ctx, (Game.story.index + 1) + " / " + Game.story.lines.length,
+    1090, 398, 12, "#8fa982", "right");
+  U.text(ctx, Game.story.index + 1 < Game.story.lines.length ? "点击继续" : "点击结束剧情",
+    1086, 654, 13, "#cfe6b0", "right");
+}
+
+function drawEnd() {
+  drawOverlayMask(0.72);
+  U.roundRect(ctx, 430, 200, 420, 400, 22);
+  ctx.fillStyle = "rgba(22,34,20,.96)";
+  ctx.fill();
+  ctx.strokeStyle = "#d97a6a";
+  ctx.lineWidth = 3;
+  ctx.stroke();
+
+  U.text(ctx, "token没啦！！！", CFG.W / 2, 262, 42, "#f0a08f", "center");
+  const st = Game.endStats || { round: 1, kills: 0 };
+  U.text(ctx, "坚守 " + st.round + " 轮 · 击杀 " + st.kills + " 只僵尸",
+    CFG.W / 2, 310, 17, "#bcd4a8", "center");
+
+  drawButton(UI.endPrimary, "再来一轮", true);
+  drawButton(UI.endMenu, "返回选关", false);
+}
+
+function drawWin() {
+  drawOverlayMask(0.76);
+  U.roundRect(ctx, 430, 170, 420, 390, 22);
+  ctx.fillStyle = "rgba(20,34,19,.97)";
+  ctx.fill();
+  ctx.strokeStyle = "#a8ca7f";
+  ctx.lineWidth = 3;
+  ctx.stroke();
+
+  U.text(ctx, "守卫成功", CFG.W / 2, 230, 42, "#efffc5", "center");
+  U.text(ctx, "token 还在，档案也还在。", CFG.W / 2, 274, 17, "#bcd4a8", "center");
+  const campaign = Game.campaign;
+  const level = campaign ? CAMPAIGN[campaign.levelId] : null;
+  if (level) {
+    U.text(ctx, "解锁档案：" + level.unlock, CFG.W / 2, 322, 22, "#ffe1a0", "center");
+    U.text(ctx, "已完成 " + level.waveLimit + " 波 · 击杀 " + Game.kills + " 只",
+      CFG.W / 2, 358, 15, "#bfd5a8", "center");
+  }
+  drawButton(UI.winMenu, "返回选关", true);
+}
+
+let almanacData = null;
+
+function fitAlmanacText(text, maxWidth, font) {
+  ctx.save();
+  ctx.font = font;
+  let out = String(text || "");
+  if (ctx.measureText(out).width > maxWidth) {
+    while (out.length && ctx.measureText(out + "…").width > maxWidth) {
+      out = out.slice(0, -1);
+    }
+    out += "…";
+  }
+  ctx.restore();
+  return out;
+}
+
+function clampAlmanacLines(text, maxWidth, font, maxLines) {
+  const lines = wrapTipText(text, maxWidth, font);
+  if (lines.length <= maxLines) return lines;
+  const out = lines.slice(0, maxLines);
+  out[maxLines - 1] = fitAlmanacText(out[maxLines - 1] + "…", maxWidth, font);
+  return out;
+}
+
+function almanacPageCount() {
+  const table = Game.almanac.tab === "plants" ? PLANTS : ZOMBIES;
+  return Math.max(1, Math.ceil(Object.keys(table).length / 4));
+}
+
+function getAlmanacData() {
+  if (almanacData) return almanacData;
+  const bodyFont = "12px 'Microsoft YaHei', sans-serif";
+  const statFont = "11px 'Microsoft YaHei', sans-serif";
+  const quoteFont = "italic 11px 'Microsoft YaHei', sans-serif";
+  const makeEntry = function (def, isPlant) {
+    const info = def.info, lore = def.lore;
+    return {
+      key: def.key,
+      isPlant: isPlant,
+      name: def.name,
+      tag: fitAlmanacText(lore.tag, 420, "12px 'Microsoft YaHei', sans-serif"),
+      role: fitAlmanacText("定位 · " + info.role, 420, "13px 'Microsoft YaHei', sans-serif"),
+      skillLines: clampAlmanacLines("技能 · " + info.skill, 420, bodyFont, 2),
+      stats: fitAlmanacText("数值 · " + info.stats.join(" · "), 420, statFont),
+      loreTitle: fitAlmanacText("档案 · " + lore.title, 420, "12px 'Microsoft YaHei', sans-serif"),
+      originLines: clampAlmanacLines(lore.origin, 420, "11px 'Microsoft YaHei', sans-serif", 2),
+      quote: fitAlmanacText("“" + lore.quote + "”", 420, quoteFont),
+      bodyFont: bodyFont,
+      statFont: statFont,
+      quoteFont: quoteFont
+    };
+  };
+  almanacData = {
+    plants: Object.keys(PLANTS).map(function (key) { return makeEntry(PLANTS[key], true); }),
+    zombies: Object.keys(ZOMBIES).map(function (key) { return makeEntry(ZOMBIES[key], false); })
+  };
+  return almanacData;
+}
+
+function drawAlmanacCard(entry, x, y, w) {
+  U.roundRect(ctx, x, y, w, 210, 12);
+  ctx.fillStyle = "rgba(255,255,255,.045)";
+  ctx.fill();
+  ctx.strokeStyle = "rgba(143,170,112,.35)";
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  U.roundRect(ctx, x + 10, y + 12, 90, 128, 9);
+  ctx.fillStyle = "rgba(8,16,9,.55)";
+  ctx.fill();
+  drawSprite(entry.key, x + 55, y + 76,
+    entry.isPlant ? 80 : 72, entry.isPlant ? 96 : 104, { t: 0 });
+
+  const tx = x + 112;
+  ctx.save();
+  ctx.textAlign = "left";
+  ctx.textBaseline = "top";
+  ctx.font = "bold 17px 'Microsoft YaHei', sans-serif";
+  ctx.fillStyle = "#efffc5";
+  ctx.fillText(entry.name, tx, y + 14);
+  ctx.font = "12px 'Microsoft YaHei', sans-serif";
+  ctx.fillStyle = "#a9c78d";
+  ctx.fillText(entry.tag, tx, y + 37);
+  ctx.font = "13px 'Microsoft YaHei', sans-serif";
+  ctx.fillStyle = "#b9d19f";
+  ctx.fillText(entry.role, tx, y + 58);
+  ctx.font = entry.bodyFont;
+  ctx.fillStyle = "#e8f2e2";
+  for (let i = 0; i < entry.skillLines.length; i++) {
+    ctx.fillText(entry.skillLines[i], tx, y + 77 + i * 15);
+  }
+  ctx.font = entry.statFont;
+  ctx.fillStyle = "#ffe1a0";
+  ctx.fillText(entry.stats, tx, y + 112);
+  ctx.font = "12px 'Microsoft YaHei', sans-serif";
+  ctx.fillStyle = "#d7ca8c";
+  ctx.fillText(entry.loreTitle, tx, y + 134);
+  ctx.font = "11px 'Microsoft YaHei', sans-serif";
+  ctx.fillStyle = "#b8c9ad";
+  for (let i = 0; i < entry.originLines.length; i++) {
+    ctx.fillText(entry.originLines[i], tx, y + 153 + i * 14);
+  }
+  ctx.font = entry.quoteFont;
+  ctx.fillStyle = "#91af9d";
+  ctx.fillText(entry.quote, tx, y + 188);
+  ctx.restore();
+}
+
+function drawAlmanacTab(r, label, active) {
+  U.roundRect(ctx, r.x, r.y, r.w, r.h, 9);
+  ctx.fillStyle = active ? "#6ba047" : "rgba(20,32,18,.9)";
+  ctx.fill();
+  ctx.strokeStyle = active ? "#d9f0a8" : "#6f8f52";
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  U.text(ctx, label, r.x + r.w / 2, r.y + r.h / 2, 16,
+    active ? "#10200d" : "#dbe9cf", "center");
+}
+
+function drawAlmanacPager(r, label, enabled) {
+  ctx.save();
+  ctx.globalAlpha = enabled ? 1 : 0.38;
+  U.roundRect(ctx, r.x, r.y, r.w, r.h, 8);
+  ctx.fillStyle = "rgba(20,32,18,.9)";
+  ctx.fill();
+  ctx.strokeStyle = "#6f8f52";
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  U.text(ctx, label, r.x + r.w / 2, r.y + r.h / 2, 13, "#dbe9cf", "center");
+  ctx.restore();
+}
+
+function drawAlmanac() {
+  drawOverlayMask(0.8);
+  U.roundRect(ctx, 44, 24, 1192, 672, 22);
+  ctx.fillStyle = "rgba(18,30,17,.98)";
+  ctx.fill();
+  ctx.strokeStyle = "#87a96d";
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  U.text(ctx, "保卫token · 角色图鉴", CFG.W / 2, 64, 32, "#efffc5", "center");
+  U.text(ctx, "token 存在证明 · 只读档案", CFG.W / 2, 88, 13, "#a9c78d", "center");
+  drawAlmanacTab(UI.almanacTabPlants, "守卫", Game.almanac.tab === "plants");
+  drawAlmanacTab(UI.almanacTabZombies, "僵尸", Game.almanac.tab === "zombies");
+  ctx.fillStyle = "rgba(151,181,122,.35)";
+  ctx.fillRect(76, 138, 1128, 1);
+
+  const data = getAlmanacData();
+  const entries = data[Game.almanac.tab];
+  const pages = almanacPageCount();
+  Game.almanac.page = U.clamp(Game.almanac.page, 0, pages - 1);
+  const start = Game.almanac.page * 4;
+  for (let i = 0; i < 4; i++) {
+    const entry = entries[start + i];
+    if (!entry) continue;
+    const col = i % 2, row = (i / 2) | 0;
+    drawAlmanacCard(entry, 76 + col * 574, 150 + row * 222, 554);
+  }
+  drawAlmanacPager(UI.almanacPrev, "上一页", Game.almanac.page > 0);
+  drawAlmanacPager(UI.almanacNext, "下一页", Game.almanac.page < pages - 1);
+  U.text(ctx, "第 " + (Game.almanac.page + 1) + " / " + pages + " 页",
+    CFG.W / 2, 651, 14, "#cfe6b0", "center");
+
+  U.roundRect(ctx, UI.almanacClose.x, UI.almanacClose.y,
+    UI.almanacClose.w, UI.almanacClose.h, 8);
+  ctx.fillStyle = "#33482f";
+  ctx.fill();
+  ctx.strokeStyle = "#7e9a6a";
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  U.text(ctx, "关闭 ×", UI.almanacClose.x + UI.almanacClose.w / 2,
+    UI.almanacClose.y + UI.almanacClose.h / 2, 14, "#e4efda", "center");
+}
+
+function drawDebug() {
+  if (!CFG.debug) return;
+  U.text(ctx, "FPS " + Game.stats.fps + " · 植物 " + Game.plants.length +
+    " · 僵尸 " + Game.zombies.length + " · 子弹 " + Game.projectiles.length +
+    " · 阳光 " + Game.suns.length, 240, CFG.H - 26, 13, "#b6f0a0");
+}
+
+function render() {
+  ctx.clearRect(0, 0, CFG.W, CFG.H);
+  if (Game.state === "MENU") drawMenu();
+  else if (Game.state === "LEVEL_SELECT") drawLevelSelect();
+  else if (Game.state === "RPS") drawRPS();
+  else {
+    drawBattle();
+    if (Game.state === "INTRO") drawIntro();
+    if (Game.state === "STORY") drawStory();
+    if (Game.state === "ROLL") drawRoll();
+    if (Game.state === "PAUSED") drawPause();
+    if (Game.state === "ALMANAC") drawAlmanac();
+    if (Game.state === "LOSE") drawEnd();
+    if (Game.state === "WIN") drawWin();
+  }
+  drawDebug();
+}
+
+/* ---------------------------------------------------------------------
+   [9] 主循环与启动
+   --------------------------------------------------------------------- */
+let lastTs = 0;
+let acc = 0;
+
+function updateCursor() {
+  const m = Game.mouse;
+  let pointer = false;
+  if (Game.state === "MENU") pointer = pointIn(m.x, m.y, UI.start);
+  if (Game.state === "MENU") pointer = pointer || pointIn(m.x, m.y, UI.rpsEntry);
+  else if (Game.state === "RPS") {
+    pointer = pointIn(m.x, m.y, UI.rpsBack);
+    for (let i = 0; !pointer && i < UI.rpsBtns.length; i++) {
+      pointer = pointIn(m.x, m.y, UI.rpsBtns[i]);
+    }
+  }
+  else if (Game.state === "LEVEL_SELECT") {
+    pointer = pointIn(m.x, m.y, UI.levelBack) || pointIn(m.x, m.y, UI.endlessCard);
+    for (let i = 0; !pointer && i <= Game.campaignUnlocked && i < CAMPAIGN.length; i++) {
+      pointer = pointIn(m.x, m.y, UI.campaignCard(i));
+    }
+  } else if (Game.state === "STORY") {
+    pointer = true;
+  } else if (Game.state === "ROLL") {
+    for (let i = 0; i < Game.buffState.choices.length; i++) {
+      if (pointIn(m.x, m.y, UI.buffCard(i))) { pointer = true; break; }
+    }
+  } else if (Game.state === "WIN") {
+    pointer = pointIn(m.x, m.y, UI.winMenu);
+  } else if (Game.state === "INTRO") {
+    pointer = pointIn(m.x, m.y, UI.introStart);
+  } else if (Game.state === "PAUSED") {
+    pointer = pointIn(m.x, m.y, UI.pauseResume) || pointIn(m.x, m.y, UI.pauseRestart) ||
+      pointIn(m.x, m.y, UI.pauseMenu);
+  } else if (Game.state === "ALMANAC") {
+    pointer = pointIn(m.x, m.y, UI.almanacClose) ||
+      pointIn(m.x, m.y, UI.almanacTabPlants) || pointIn(m.x, m.y, UI.almanacTabZombies) ||
+      (Game.almanac.page > 0 && pointIn(m.x, m.y, UI.almanacPrev)) ||
+      (Game.almanac.page < almanacPageCount() - 1 && pointIn(m.x, m.y, UI.almanacNext));
+  } else if (Game.state === "LOSE") {
+    pointer = pointIn(m.x, m.y, UI.endPrimary) || pointIn(m.x, m.y, UI.endMenu);
+  } else if (Game.state === "PLAYING") {
+    pointer = pointIn(m.x, m.y, UI.pause) || pointIn(m.x, m.y, UI.almanac) ||
+      pointIn(m.x, m.y, CFG.shovel);
+    if (!pointer && inGrid(m.x, m.y) && Game.selected >= 0) pointer = true;
+    if (!pointer) {
+      for (let i = 0; i < Game.cards.length; i++) {
+        if (pointIn(m.x, m.y, cardRect(i))) { pointer = true; break; }
+      }
+    }
+  }
+  canvas.style.cursor = pointer ? "pointer" : "crosshair";
+}
+
+function loop(ts) {
+  if (!lastTs) lastTs = ts;
+  let dt = (ts - lastTs) / 1000;
+  lastTs = ts;
+  // 切后台回来时 dt 可能极大，钳制后丢弃多余累积，避免一口吃掉所有僵尸
+  if (dt > 0.25 * CFG.speedMultiplier) dt = 0.25 * CFG.speedMultiplier;
+
+  acc += dt * CFG.speedMultiplier;
+  let steps = 0;
+  while (acc >= CFG.FIXED_DT && steps < CFG.maxSteps) {
+    step(CFG.FIXED_DT);
+    acc -= CFG.FIXED_DT;
+    steps++;
+  }
+  if (steps >= CFG.maxSteps) acc = 0;
+
+  Game.stats.acc += dt;
+  Game.stats.frames++;
+  if (Game.stats.acc >= 0.5) {
+    Game.stats.fps = Math.round(Game.stats.frames / Game.stats.acc);
+    Game.stats.acc = 0;
+    Game.stats.frames = 0;
+  }
+
+  updateCursor();
+  render();
+  requestAnimationFrame(loop);
+}
+
+function boot() {
+  Game.campaignUnlocked = loadCampaignUnlocked();
+  setState("MENU");
+  Game.sunFallTimer = CFG.sun.fallFirst;
+  requestAnimationFrame(loop);
+}
+
+loadAssets().then(boot);
+</script>
+</body>
+</html>
