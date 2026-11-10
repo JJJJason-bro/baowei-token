@@ -2079,7 +2079,7 @@ function updateSuns(dt) {
       const d = Math.sqrt(dx * dx + dy * dy);
       const step = CFG.sun.collectSpeed * dt;
       if (d < step || d < 12) {
-        Game.sun += CFG.sun.value * Game.modifiers.sunMul;
+        Game.sun += Math.round(CFG.sun.value * Game.modifiers.sunMul);
         s.dead = true;
       } else {
         s.x += dx / d * step;

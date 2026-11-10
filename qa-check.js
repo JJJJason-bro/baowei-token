@@ -17,6 +17,8 @@ assert(/maxSteps:\s*8\b/.test(js) && /speedMultiplier:\s*1\.25\b/.test(js),
 assert(/autoCollect:\s*true/.test(js) &&
   /if \(CFG\.sun\.autoCollect\) \{\s*collectSun\(s\)/.test(js),
   "automatic sun collection is missing");
+assert(/Game\.sun \+= Math\.round\(CFG\.sun\.value \* Game\.modifiers\.sunMul\)/.test(js),
+  "sun gain must be normalized to whole numbers");
 assert(/collectSpeed:\s*460\b/.test(js), "sun collection speed is not updated");
 assert(/acc \+= dt \* CFG\.speedMultiplier/.test(js) && !/playbackRate/.test(js),
   "logic speed or BGM isolation is incorrect");
